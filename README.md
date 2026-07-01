@@ -26,21 +26,60 @@ Extensions for [pi-coding-agent](https://github.com/badlogic/pi-mono) that add C
 - **structured-compaction / session-state-loader** — structured session state across compactions and restarts.
 - **bash-error-hint / tool-hint** — small quality-of-life hints.
 
-## Install
+## Setup with pi-coding-agent
+
+**Prerequisite:** a working [pi](https://github.com/badlogic/pi-mono) install (`npm install -g @mariozechner/pi-coding-agent`, or the scope your distribution uses) with at least one model provider configured.
+
+**1. Clone the package:**
 
 ```bash
 git clone https://github.com/kh0pper/pi-lab ~/pi-lab
-# add "../../pi-lab" to the packages array in ~/.pi/agent/settings.json
-bash ~/pi-lab/scripts/install-bridges.sh   # symlink agents/prompts into ~/.pi/agent
 ```
 
-There is no build step — pi loads the TypeScript directly at startup.
+**2. Register it with pi.** Add the clone to the `packages` array in `~/.pi/agent/settings.json` (path is relative to that file, so `../../pi-lab` = `~/pi-lab`):
 
-Verify extensions load:
+```json
+{
+  "packages": ["../../pi-lab"]
+}
+```
+
+**3. Install the agent/prompt symlinks** (subagent definitions, slash-command prompts, and any Claude Code skill bridges you have):
 
 ```bash
-npm run test:extensions
+bash ~/pi-lab/scripts/install-bridges.sh
 ```
+
+**4. Bind models.** The bundled agents reference example providers (`zai-coding`, `crow-local`). Point them at *your* providers either by editing the `model:` frontmatter in `extensions/subagent/agents/*.md`, or interactively with `/agent-models` inside pi. Providers live in `~/.pi/agent/models.json`, e.g.:
+
+```json
+{
+  "providers": {
+    "openai": {
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "api": "openai-completions",
+      "apiKey": "OPENAI_API_KEY",
+      "models": [{ "id": "gpt-5.2", "name": "GPT-5.2", "contextWindow": 400000, "maxTokens": 32000 }]
+    }
+  }
+}
+```
+
+Any OpenAI-compatible endpoint works the same way (local llama.cpp, z.ai, …) — set `baseUrl` accordingly. `apiKey` accepts a literal key, an env-var name, or a `!command` that prints the key.
+
+**5. Restart pi.** Extensions load at session start (no build step — pi imports the TypeScript directly). You should see `plan-mode, subagent, critic, notify, web, …` in the startup extensions list.
+
+**6. Verify:**
+
+```bash
+cd ~/pi-lab && npm run test:extensions   # loader gate
+# then inside pi: /plan  →  the planning-model picker should appear
+```
+
+**Optional — remote hub (Perch):** `bash ~/pi-lab/hub/install.sh` installs the per-machine hub as a systemd user service, and setting `"remoteRegister": { "hubUrl": "http://127.0.0.1:4201" }` in settings.json makes every interactive session appear in it. Set `"pi-webserver": { "apiToken": "<openssl rand -hex 32>" }` for auth, and front `127.0.0.1:4200` with your HTTPS proxy (Tailscale Serve, Caddy, …).
+
+**Optional — push notifications:** run an [ntfy](https://ntfy.sh) server and set `"notify": { "url": "https://your-ntfy-host", "topic": "pi", "token": "tk_..." }`.
 
 ## Configuration
 
