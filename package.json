@@ -1,0 +1,32 @@
+{
+  "name": "pi-lab",
+  "version": "0.1.0",
+  "description": "Claude Code parity for pi-coding-agent: plan mode, sub-agents, TodoWrite, and MCP client for Crow integration",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "author": "kh0pp",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "bin": {
+    "pi-extension-check": "./bin/pi-extension-check"
+  },
+  "scripts": {
+    "test:extensions": "fail=0; for f in extensions/*.ts extensions/*/index.ts; do case \"$f\" in extensions/todo.ts|extensions/subagent/index.ts) echo \"=== $f === SKIP (imports @mariozechner/pi-ai; works at pi runtime but jiti standalone hits the pi-ai CJS exports gap)\"; continue;; extensions/plan-mode/index.ts|extensions/web/index.ts|extensions/critic/index.ts) echo \"=== $f === SKIP (value-imports pi internals/pi-tui; resolvable only through pi's runtime alias map)\"; continue;; esac; echo \"=== $f ===\"; ./bin/pi-extension-check \"$f\" || fail=1; done; exit $fail"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

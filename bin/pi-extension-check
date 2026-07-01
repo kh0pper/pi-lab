@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# pi-extension-check — verify a pi extension parses + loads + exports a function.
+#
+# Usage:
+#   pi-extension-check <path-to-extension.ts>
+#
+# Exit codes:
+#   0  OK — file loads and default export is a function
+#   2  FAIL — load/parse/shape error
+#   3  FAIL — pi binary not on PATH
+#   4  FAIL — bundled jiti not found
+#
+# Resolves jiti from the active pi install (follows the `pi` symlink, looks
+# inside its node_modules). Uses the same node binary pi runs under.
+
+set -e
+
+EXT="${1:?usage: pi-extension-check <path-to-extension.ts>}"
+[ -f "$EXT" ] || { echo "FAIL: file not found: $EXT" >&2; exit 2; }
+
+PI_BIN="$(command -v pi || true)"
+if [ -z "$PI_BIN" ]; then
+    # Fallback: try common nvm install dirs (newest version wins).
+    for cand in ~/.nvm/versions/node/v*/bin/pi; do
+        [ -x "$cand" ] && PI_BIN="$cand"
+    done
+fi
+[ -n "$PI_BIN" ] || { echo "FAIL: 'pi' not on PATH and no nvm install found" >&2; exit 3; }
+
+PI_TARGET="$(readlink -f "$PI_BIN")"
+PI_ROOT="$(cd "$(dirname "$PI_TARGET")/.." && pwd)"
+
+# pi >=0.73 ships plain `jiti`; older pi vendored `@mariozechner/jiti`.
+# Try both so the verifier tracks the installed pi instead of a fixed path.
+JITI=""
+for cand in \
+    "$PI_ROOT/node_modules/jiti/lib/jiti.mjs" \
+    "$PI_ROOT/node_modules/@mariozechner/jiti/lib/jiti.mjs"; do
+    [ -f "$cand" ] && { JITI="$cand"; break; }
+done
+[ -n "$JITI" ] || { echo "FAIL: jiti not found under $PI_ROOT/node_modules (tried jiti/ and @mariozechner/jiti/)" >&2; exit 4; }
+
+NODE_BIN="$(dirname "$PI_BIN")/node"
+[ -x "$NODE_BIN" ] || NODE_BIN="$(command -v node)"
+
+EXT_ABS="$(readlink -f "$EXT")"
+
+# Set NODE_PATH to pi's node_modules so peer deps (typebox,
+# @modelcontextprotocol/sdk, etc.) resolve the same way they do at runtime.
+export NODE_PATH="$PI_ROOT/node_modules${NODE_PATH:+:$NODE_PATH}"
+
+"$NODE_BIN" --input-type=module -e "
+import { createJiti } from '$JITI';
+const jiti = createJiti('$PI_ROOT', { interopDefault: true });
+try {
+  const mod = await jiti.import('$EXT_ABS');
+  const fn = mod.default ?? mod;
+  if (typeof fn !== 'function') {
+    console.error('FAIL: default export is not a function (got ' + typeof fn + ')');
+    process.exit(2);
+  }
+  console.log('OK');
+} catch (e) {
+  console.error('FAIL: ' + (e && e.message ? e.message : e));
+  process.exit(2);
+}
+"

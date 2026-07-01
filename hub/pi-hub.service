@@ -1,0 +1,15 @@
+[Unit]
+Description=pi session hub (multi-session web access for pi-coding-agent)
+After=network-online.target
+
+[Service]
+# node path resolved by install.sh (nvm layouts differ per machine)
+ExecStart=__NODE__ __REPO__/hub/server.mjs
+Restart=on-failure
+RestartSec=3
+# Loopback-only listeners; Tailscale Serve provides the HTTPS front door.
+Environment=PI_HUB_PORT=4200
+Environment=PI_HUB_REGISTRY_PORT=4201
+
+[Install]
+WantedBy=default.target
