@@ -217,6 +217,49 @@ export default async function mcpClientExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	// Cross-extension bridge: invoke an MCP tool extension-side ("pi-lab:mcp-call").
+	// Synchronous emit + mutable payload (same pattern as background-tasks' pi-lab:bg-list):
+	// the caller emits {server, tool, args, timeoutMs?} and then checks payload.promise —
+	// unset means the server is missing/unhealthy/not allowlisted (caller fails open).
+	// NOT an escalation channel: bus emitters are in-process extension code only (the
+	// model, hooks, and the web prompt route cannot emit arbitrary bus events). Still,
+	// defense-in-depth: only allowlisted servers are callable (settings.mcp.bridgeServers,
+	// default ["crow-memory"]), and every bridge call logs one stderr line.
+	pi.events.on("pi-lab:mcp-call", (payload: unknown) => {
+		const p = payload as {
+			server: string;
+			tool: string;
+			args?: Record<string, unknown>;
+			timeoutMs?: number;
+			promise?: Promise<{ isError: boolean; text: string }>;
+		};
+		let allowed = ["crow-memory"];
+		try {
+			const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+			const raw = JSON.parse(readFileSync(settingsPath, "utf8")) as { mcp?: { bridgeServers?: string[] } };
+			if (Array.isArray(raw.mcp?.bridgeServers)) allowed = raw.mcp.bridgeServers;
+		} catch {
+			// keep default allowlist
+		}
+		if (!allowed.includes(p.server)) return;
+		const state = states.get(p.server);
+		if (!state?.healthy || !state.client) return;
+		process.stderr.write(`[mcp-client] bridge call: ${p.server}/${p.tool}\n`);
+		p.promise = withTimeout(
+			state.client.callTool({ name: p.tool, arguments: p.args ?? {} }),
+			Math.min(p.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS),
+			`bridge call ${p.server}/${p.tool}`,
+		).then((result) => {
+			const content = Array.isArray(result.content) ? result.content : [];
+			const text = content
+				.map((c: { type?: string; text?: string }) =>
+					c?.type === "text" && typeof c.text === "string" ? c.text : JSON.stringify(c),
+				)
+				.join("\n");
+			return { isError: Boolean(result.isError), text };
+		});
+	});
+
 	// Close all MCP connections on session end so pi exits cleanly.
 	pi.on("session_shutdown", async () => {
 		await Promise.allSettled(Array.from(states.values()).map(async (s) => {

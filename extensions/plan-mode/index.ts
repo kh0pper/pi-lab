@@ -474,6 +474,11 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		const text = getTextContent(event.message);
 		if (markCompletedSteps(text, todoItems) > 0) {
 			updateStatus(ctx);
+			// Per-step signal: edit-gate's optional stepTestCommand gate keys on this.
+			pi.events.emit("plan-mode:progress", {
+				done: todoItems.filter((t) => t.completed).length,
+				total: todoItems.length,
+			});
 		}
 		persistState();
 	});

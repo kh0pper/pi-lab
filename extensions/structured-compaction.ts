@@ -34,6 +34,8 @@ interface SessionState {
 	decisions: string[];
 	open_items: string[];
 	next_steps: string[];
+	/** One-line error summaries only — bodies are scrubbed (see scrubErrors). */
+	errors: string[];
 	key_context: string;
 }
 
@@ -43,6 +45,7 @@ const EMPTY_STATE: SessionState = {
 	decisions: [],
 	open_items: [],
 	next_steps: [],
+	errors: [],
 	key_context: "",
 };
 
@@ -51,8 +54,25 @@ const HEADER_MAP: Array<{ field: keyof Omit<SessionState, "updated_at" | "cwd">;
 	{ field: "decisions", headers: ["decisions", "key decisions", "decisions made"] },
 	{ field: "open_items", headers: ["open items", "open", "blockers", "in progress", "todo", "todos"] },
 	{ field: "next_steps", headers: ["next steps", "next", "to do next", "follow-ups"] },
+	// Opportunistic: pi's default summary prompt doesn't emit an Errors header today,
+	// but if one appears (custom compaction, future upstream) we capture it.
+	{ field: "errors", headers: ["errors", "error traces", "critical errors", "failures"] },
 	{ field: "key_context", headers: ["key context", "context", "critical context", "background"] },
 ];
+
+/**
+ * Error-scrubbing (research: models self-condition on their own past errors —
+ * re-injecting error-laden history measurably degrades long-horizon accuracy).
+ * Keep the SIGNAL (that something failed, one line) and drop the NOISE
+ * (stack traces, repeated tool-error bodies) before anything is persisted and
+ * re-injected into future sessions by session-state-loader.
+ */
+function scrubErrors(items: string[]): string[] {
+	return items.map((line) => {
+		const flat = line.replace(/\s+/g, " ").trim();
+		return flat.length > 160 ? `${flat.slice(0, 157)}…` : flat;
+	});
+}
 
 function parseSummary(summary: string): Partial<SessionState> {
 	const out: Partial<SessionState> = {};
@@ -112,6 +132,7 @@ function loadExisting(path: string): SessionState {
 			decisions: Array.isArray(data.decisions) ? data.decisions : [],
 			open_items: Array.isArray(data.open_items) ? data.open_items : [],
 			next_steps: Array.isArray(data.next_steps) ? data.next_steps : [],
+			errors: Array.isArray(data.errors) ? data.errors : [],
 			key_context: typeof data.key_context === "string" ? data.key_context : "",
 		};
 	} catch {
@@ -153,6 +174,7 @@ export default function (pi: ExtensionAPI) {
 			!parsed.decisions?.length &&
 			!parsed.open_items?.length &&
 			!parsed.next_steps?.length &&
+			!parsed.errors?.length &&
 			!parsed.key_context
 		) {
 			return;
@@ -164,8 +186,9 @@ export default function (pi: ExtensionAPI) {
 			cwd: process.cwd(),
 			goals: dedupAppend(existing.goals, parsed.goals ?? [], 10),
 			decisions: dedupAppend(existing.decisions, parsed.decisions ?? [], 50),
-			open_items: parsed.open_items ?? existing.open_items,
+			open_items: scrubErrors(parsed.open_items ?? existing.open_items),
 			next_steps: parsed.next_steps ?? existing.next_steps,
+			errors: scrubErrors(parsed.errors ?? []).slice(-10), // latest compaction only, capped
 			key_context: parsed.key_context ?? existing.key_context,
 		};
 

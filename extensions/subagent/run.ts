@@ -41,6 +41,8 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	/** Set when the leg was killed for exceeding maxTurns (distinct from abort). */
+	budgetExceeded?: boolean;
 }
 
 export interface SubagentDetails {
@@ -135,6 +137,12 @@ export async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	toolsOverride?: string[],
+	// Optional per-leg turn budget (research: abort-and-retry-fresh beats grinding —
+	// successful agent runs are short; failures grind long). Passed ONLY by the
+	// subagent tool's executor. Critics and other direct callers pass nothing and
+	// are never budget-killed (a killed critic = missing fenced verdict = failed
+	// review, fail-closed).
+	maxTurns?: number,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -231,6 +239,13 @@ export async function runSingleAgent(
 
 					if (msg.role === "assistant") {
 						currentResult.usage.turns++;
+						if (maxTurns && currentResult.usage.turns >= maxTurns && !currentResult.budgetExceeded) {
+							currentResult.budgetExceeded = true;
+							proc.kill("SIGTERM");
+							setTimeout(() => {
+								if (!proc.killed) proc.kill("SIGKILL");
+							}, 5000);
+						}
 						const usage = msg.usage;
 						if (usage) {
 							currentResult.usage.input += usage.input || 0;

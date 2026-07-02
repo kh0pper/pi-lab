@@ -554,6 +554,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 	// managed local models whose server is down, this STARTS the server
 	// (docker compose, stopping same-group peers), then switches — progress
 	// streams over SSE as model_starting/model_switched/model_error events.
+	// Auto-mode permission classifier fallback — set via permission-modes.ts's
+	// bus API (fresh re-read + atomic write + abort-on-parse-failure lives there).
+	if (p === "/classifier" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { model?: string };
+			const q: { model?: string; error?: string | null } = { model: (body.model ?? "").trim() };
+			_pi?.events.emit("pi-lab:classifier-set", q);
+			if (q.error === undefined) { json(res, 503, { error: "permission-modes extension not loaded" }); return; }
+			if (q.error) { json(res, 400, { error: q.error }); return; }
+			json(res, 200, { ok: true, model: q.model });
+		} catch (err) {
+			json(res, 400, { error: (err as Error).message });
+		}
+		return;
+	}
+
 	if (p === "/model" && req.method === "POST") {
 		try {
 			const body = JSON.parse(await readBody(req)) as { model?: string };
@@ -700,6 +716,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 				sessionId,
 				sessionName,
 				sessionArchived,
+				classifier: (() => {
+					// answered synchronously by permission-modes.ts
+					const q: { dedicated?: string | null; fallback?: string } = {};
+					_pi?.events.emit("pi-lab:classifier-info", q);
+					return q.fallback !== undefined ? q : null;
+				})(),
 			},
 			system: {
 				nodeVersion: process.version,

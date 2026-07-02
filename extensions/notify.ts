@@ -130,11 +130,21 @@ export default function (pi: ExtensionAPI) {
 		webInitiated = true;
 	});
 
+	// handoff.ts's internal summary turn must not fire a "run finished" push.
+	let skipNextAgentEnd = false;
+	pi.events.on("pi-lab:handoff-turn", () => {
+		skipNextAgentEnd = true;
+	});
+
 	pi.on("agent_start", () => {
 		agentStartedAt = Date.now();
 	});
 
 	pi.on("agent_end", (event) => {
+		if (skipNextAgentEnd) {
+			skipNextAgentEnd = false;
+			return;
+		}
 		if (cfg.onAgentEnd === false) return;
 		const fromWeb = webInitiated;
 		webInitiated = false;

@@ -34,6 +34,56 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 
+/** settings.subagent.maxStepsPerLeg — per-leg turn budget (0/absent = unlimited). */
+function maxStepsPerLeg(): number | undefined {
+	try {
+		const raw = JSON.parse(
+			fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "settings.json"), "utf8"),
+		) as { subagent?: { maxStepsPerLeg?: number } };
+		const n = raw.subagent?.maxStepsPerLeg;
+		return typeof n === "number" && n > 0 ? n : 24; // generous default: abort-and-retry beats grinding
+	} catch {
+		return 24;
+	}
+}
+
+/**
+ * runSingleAgent + budget: a leg that exceeds the turn budget is killed and
+ * retried ONCE with a fresh context and a one-line note (NOT the failed
+ * transcript — models self-condition on their own past errors). Only the
+ * subagent tool uses this wrapper; critics call runSingleAgent directly and
+ * are never budget-killed.
+ */
+async function runLegWithBudget(
+	defaultCwd: string,
+	agents: AgentConfig[],
+	agentName: string,
+	task: string,
+	cwd: string | undefined,
+	step: number | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	toolsOverride?: string[],
+): Promise<SingleResult> {
+	const budget = maxStepsPerLeg();
+	const first = await runSingleAgent(
+		defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails, toolsOverride, budget,
+	);
+	if (!first.budgetExceeded) return first;
+	const retryTask =
+		`Note: a previous attempt at this task was aborted after exceeding ${budget} turns. ` +
+		`Start fresh, be direct, and prefer the shortest correct path.\n\n${task}`;
+	const second = await runSingleAgent(
+		defaultCwd, agents, agentName, retryTask, cwd, step, signal, onUpdate, makeDetails, toolsOverride, budget,
+	);
+	if (second.budgetExceeded) {
+		second.errorMessage = `leg exceeded the ${budget}-turn budget twice (settings.subagent.maxStepsPerLeg)`;
+		second.exitCode = second.exitCode || 1;
+	}
+	return second;
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -278,7 +328,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-					const result = await runSingleAgent(
+					const result = await runLegWithBudget(
 						ctx.cwd,
 						agents,
 						step.agent,
@@ -353,7 +403,7 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
+					const result = await runLegWithBudget(
 						ctx.cwd,
 						agents,
 						t.agent,
@@ -394,7 +444,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				const result = await runSingleAgent(
+				const result = await runLegWithBudget(
 					ctx.cwd,
 					agents,
 					params.agent,

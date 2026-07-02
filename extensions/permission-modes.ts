@@ -40,7 +40,7 @@
  * banner + push so a hub-spawned session never goes silently quiet.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -195,6 +195,100 @@ export default function (pi: ExtensionAPI) {
 	pi.events.on("command:mode", (data) => {
 		const arg = (((data as { args?: string })?.args) ?? "").trim() as Mode;
 		if (MODES.includes(arg) && lastCtx) setMode(arg, lastCtx);
+	});
+
+	// --- /classifier — view/switch the auto-mode classifier model -------------
+	// The dedicated endpoint (classifierUrl + classifierId) is tried first and
+	// stays settings.json-only (URL + raw id don't fit a picker). This command
+	// surfaces the resolved chain and re-binds the FALLBACK (classifierModel).
+
+	function describeClassifier(): string {
+		const cfg = loadConfig();
+		const dedicated = cfg.classifierUrl && cfg.classifierId ? `${cfg.classifierId} @ ${cfg.classifierUrl}` : null;
+		const fallback = cfg.classifierModel ?? "current";
+		return dedicated
+			? `dedicated: ${dedicated} → fallback: ${fallback}`
+			: `no dedicated endpoint → ${fallback === "current" ? "current session model" : fallback}`;
+	}
+
+	/** Persist classifierModel with write discipline: fresh re-read, tmp+rename,
+	 *  hard-abort on parse failure (settings.json holds hooks + permission config —
+	 *  never write a reconstructed object). */
+	function persistClassifierModel(value: string): string | null {
+		try {
+			const raw = readFileSync(SETTINGS_PATH, "utf8");
+			const settings = JSON.parse(raw) as Record<string, unknown>;
+			const pm = (settings.permissionModes ?? {}) as Record<string, unknown>;
+			pm.classifierModel = value;
+			settings.permissionModes = pm;
+			const tmp = `${SETTINGS_PATH}.tmp-${process.pid}`;
+			writeFileSync(tmp, JSON.stringify(settings, null, 2));
+			renameSync(tmp, SETTINGS_PATH);
+			return null;
+		} catch (err) {
+			return (err as Error).message;
+		}
+	}
+
+	function setClassifier(value: string, ctx: ExtensionContext): void {
+		const err = persistClassifierModel(value);
+		if (err) {
+			ctx.ui.notify(`[classifier] NOT saved — settings.json unreadable/unparseable (${err.slice(0, 80)})`, "error");
+			return;
+		}
+		const msg = `classifier fallback → ${value === "current" ? "current session model" : value}`;
+		ctx.ui.notify(`[classifier] ${msg}`, "info");
+		pi.events.emit("command_result", { command: "classifier", message: msg, type: "info" });
+	}
+
+	pi.registerCommand("classifier", {
+		description: "Show or switch the auto-mode permission classifier: /classifier [provider/id|current]",
+		handler: async (args, ctx) => {
+			const arg = (args ?? "").trim();
+			if (arg) {
+				if (arg !== "current" && !arg.includes("/")) {
+					ctx.ui.notify("[classifier] use provider/id form (or 'current')", "warning");
+					return;
+				}
+				return setClassifier(arg, ctx);
+			}
+			if (!ctx.hasUI) return;
+			const keep = `keep as is — ${describeClassifier()}`;
+			const models = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+			const choice = await ctx.ui.select("Auto-mode classifier fallback:", [
+				keep,
+				"current — always use the session's active model",
+				...models,
+			]);
+			if (!choice || choice === keep) return;
+			setClassifier(choice.startsWith("current") ? "current" : choice, ctx);
+		},
+	});
+
+	pi.events.on("command:classifier", (data) => {
+		const arg = (((data as { args?: string })?.args) ?? "").trim();
+		if (!lastCtx) return;
+		if (!arg) {
+			pi.events.emit("command_result", { command: "classifier", message: describeClassifier(), type: "info" });
+			return;
+		}
+		if (arg === "current" || arg.includes("/")) setClassifier(arg, lastCtx);
+	});
+
+	// PWA settings surface: status info + setter, consumed by mobile.ts.
+	pi.events.on("pi-lab:classifier-info", (payload: unknown) => {
+		const cfg = loadConfig();
+		const p = payload as { dedicated?: string | null; fallback?: string };
+		p.dedicated = cfg.classifierUrl && cfg.classifierId ? `${cfg.classifierId} @ ${cfg.classifierUrl}` : null;
+		p.fallback = cfg.classifierModel ?? "current";
+	});
+	pi.events.on("pi-lab:classifier-set", (payload: unknown) => {
+		const p = payload as { model?: string; error?: string | null };
+		if (!p.model || (p.model !== "current" && !p.model.includes("/"))) {
+			p.error = "use provider/id form (or 'current')";
+			return;
+		}
+		p.error = persistClassifierModel(p.model);
 	});
 
 	pi.registerShortcut("shift+tab", {

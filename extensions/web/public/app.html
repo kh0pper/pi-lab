@@ -86,6 +86,12 @@
 		.m-user { align-self: flex-end; background: var(--teal); color: #fff; border-bottom-right-radius: var(--r-xs); }
 		.m-agent { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: var(--r-xs); }
 		.m-agent pre { background: var(--sky); padding: 8px 10px; border-radius: var(--r-xs); overflow-x: auto; font: 12.5px var(--mono); margin: 6px 0; }
+		.m-agent { position: relative; }
+		.prewrap { position: relative; }
+		.copy-pre { position: absolute; top: 10px; right: 6px; z-index: 1; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-xs); color: inherit; padding: 1px 7px; font-size: 12px; opacity: .65; cursor: pointer; }
+		.copy-msg { float: right; margin: 0 0 4px 8px; background: none; border: none; color: inherit; opacity: .45; font-size: 13px; cursor: pointer; padding: 2px 4px; }
+		.copy-pre:active, .copy-msg:active { opacity: 1; }
+		.copied { opacity: 1 !important; color: var(--teal, #2a9d8f) !important; }
 		.m-agent code { font: 12.5px var(--mono); color: var(--teal); }
 		.m-agent p { margin: 0 0 8px; } .m-agent p:last-child { margin: 0; }
 		.m-agent ul, .m-agent ol { margin: 4px 0; padding-left: 20px; }
@@ -216,15 +222,52 @@
 
 		const fmtSize = (b) => b > 1048576 ? (b / 1048576).toFixed(1) + "M" : b > 1024 ? Math.round(b / 1024) + "K" : b + "B";
 		const tm = (iso) => (iso || new Date().toISOString()).slice(11, 19);
-		// minimal safe markdown-ish rendering: escape first, then bold/code/pre
+		// minimal safe markdown-ish rendering: escape first, then bold/code/pre.
+		// Fence contents are stashed as placeholders BEFORE the inline/br passes —
+		// otherwise those passes corrupt code (backticks/** inside code) and turn
+		// newlines into <br>, which breaks pre rendering AND makes pre.textContent
+		// (the copy source) collapse multiline code into one line.
 		const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 		function md(s) {
 			let x = esc(s);
-			x = x.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, c) => `<pre>${c}</pre>`);
+			const stash = [];
+			x = x.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, c) => {
+				stash.push(c);
+				return `\x00PRE${stash.length - 1}\x00`;
+			});
 			x = x.replace(/`([^`\n]+)`/g, "<code>$1</code>");
 			x = x.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
 			x = x.replace(/\n/g, "<br>");
+			x = x.replace(/\x00PRE(\d+)\x00/g, (_, i) =>
+				`<div class="prewrap"><button class="copy-pre" aria-label="Copy code">⧉</button><pre>${stash[Number(i)]}</pre></div>`);
 			return x;
+		}
+
+		// one-tap copy with ✓ flash; execCommand fallback for non-secure contexts
+		function copyText(text, btn) {
+			const flash = () => {
+				if (!btn) return;
+				const orig = btn.textContent;
+				btn.textContent = "✓";
+				btn.classList.add("copied");
+				setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied"); }, 1200);
+			};
+			if (navigator.clipboard?.writeText) {
+				navigator.clipboard.writeText(text).then(flash).catch(() => {});
+			} else {
+				const ta = document.createElement("textarea");
+				ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+				document.body.appendChild(ta); ta.select();
+				try { document.execCommand("copy"); flash(); } catch {}
+				document.body.removeChild(ta);
+			}
+		}
+		// delegation for copy buttons living inside dangerouslySetInnerHTML
+		function onMsgsClick(e) {
+			const btn = e.target.closest?.(".copy-pre");
+			if (!btn) return;
+			const pre = btn.parentElement?.querySelector("pre");
+			if (pre) copyText(pre.textContent, btn);
 		}
 
 		function App() {
@@ -348,7 +391,7 @@
 
 				<div class="content">
 					${tab === "chat" && html`<${Chat} msgs=${msgs} busy=${busy} onSend=${send} msgsRef=${msgsRef} />`}
-					${tab === "session" && html`<${Session} status=${status} plan=${plan} refresh=${refreshStatus} send=${send} />`}
+					${tab === "session" && html`<${Session} status=${status} plan=${plan} refresh=${refreshStatus} send=${send} openSheet=${openSheet} />`}
 					${tab === "files" && html`<${Files} />`}
 					${tab === "activity" && html`<${Activity} acts=${acts} />`}
 				</div>
@@ -373,6 +416,18 @@
 						<div class="note">How much pi asks before acting. Prompts appear in the terminal — you'll get a banner + push here when one is waiting.</div>
 						${[["ask", "Ask — prompt for edits, commands, and tools"], ["accept-edits", "Accept edits — file changes free; commands prompt"], ["auto", "Auto — local classifier judges commands; only risky ones prompt"], ["bypass", "Bypass — run everything (catastrophic guard stays on)"]].map(([m, label]) => html`
 							<button class="opt ${permMode === m ? "hot" : ""}" onClick=${() => { setSheet(null); if (permMode !== m) sendPrompt("/mode " + m); }}>${permMode === m ? "current — " : ""}${label}</button>
+						`)}
+					`}
+					${sheet === "classifier" && html`
+						<h3>Permission classifier (auto mode)</h3>
+						<div class="note">The model that judges commands in <b>auto</b> mode. ${status?.agent?.classifier?.dedicated ? html`A dedicated endpoint (<b>${status.agent.classifier.dedicated}</b>) is tried first — this picker sets the <b>fallback</b> used when it's unreachable.` : "No dedicated endpoint configured — this model does all classification."} Unknown verdicts always fail closed to a prompt.</div>
+						${[["current", "current session model"], ...models.models.map((m) => [m, m])].map(([val, label]) => html`
+							<button class="opt ${status?.agent?.classifier?.fallback === val ? "hot" : ""}" onClick=${async () => {
+								setSheet(null);
+								const r = await post("/classifier", { model: val });
+								addMsg({ kind: "sys", text: r?.ok ? `classifier fallback → ${val}` : `classifier not saved: ${r?.error ?? "error"}` });
+								refreshStatus();
+							}}>${status?.agent?.classifier?.fallback === val ? "current — " : ""}${label}</button>
 						`)}
 					`}
 					${sheet === "model" && html`
@@ -451,13 +506,16 @@
 
 			return html`
 				<div class="chat">
-					<div class="msgs" ref=${msgsRef}>
+					<div class="msgs" ref=${msgsRef} onClick=${onMsgsClick}>
 						${msgs.length === 0 && html`<div class="empty"><span class="bird">${BIRD}</span><span class="t">Message your session — it lands as if typed in the terminal.</span></div>`}
 						${msgs.map((m) => {
 							if (m.kind === "user") return html`<div class="m m-user">
 								${m.imgs?.length ? html`<div class="thumbs">${m.imgs.map((src) => html`<img src=${src} alt="attachment" />`)}</div>` : null}${m.text}
 							</div>`;
-							if (m.kind === "agent") return html`<div class="m m-agent" dangerouslySetInnerHTML=${{ __html: md(m.text) }}></div>`;
+							if (m.kind === "agent") return html`<div class="m m-agent">
+								<button class="copy-msg" aria-label="Copy message" onClick=${(e) => copyText(m.text, e.currentTarget)}>⧉</button>
+								<div dangerouslySetInnerHTML=${{ __html: md(m.text) }}></div>
+							</div>`;
 							if (m.kind === "file") {
 								const src = APP_BASE + "/api/mobile/files/sent/" + m.id;
 								return html`<div class="m m-agent m-file">
@@ -499,7 +557,7 @@
 			`;
 		}
 
-		function Session({ status, plan, refresh, send }) {
+		function Session({ status, plan, refresh, send, openSheet }) {
 			useEffect(() => { refresh(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
 			const a = status?.agent ?? {}; const s = status?.system ?? {};
 			const rename = async () => {
@@ -526,6 +584,7 @@
 						<div class="kv"><span class="k">uptime</span><span class="v">${s.uptimeSeconds ? Math.round(s.uptimeSeconds / 60) + "m" : "—"}</span></div>
 						<div class="kv"><span class="k">memory</span><span class="v">${s.memoryMB ? s.memoryMB + " MB" : "—"}</span></div>
 						<div class="kv"><span class="k">tools</span><span class="v">${status?.tools?.count ?? "—"}</span></div>
+						<div class="kv"><span class="k">classifier</span><span class="v" style="cursor:pointer;text-decoration:underline dotted" onClick=${() => openSheet("classifier")}>${a.classifier ? (a.classifier.dedicated ? `${a.classifier.dedicated.split(" @ ")[0]} → ${a.classifier.fallback}` : a.classifier.fallback) : "—"}</span></div>
 					</div>
 					${plan?.todosTotal > 0 && html`
 						<div class="card"><h3>Plan progress — ${plan.todosDone}/${plan.todosTotal}</h3></div>

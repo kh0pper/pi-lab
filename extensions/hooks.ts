@@ -217,6 +217,8 @@ export default function (pi: ExtensionAPI) {
 	let pendingContext: string[] = [];
 	/** Set by background-tasks.ts just before it wakes the agent; Stop hooks skip that turn. */
 	let skipNextStop = false;
+	/** Set by handoff.ts before its internal summary turn; UserPromptSubmit skips that prompt. */
+	let skipNextInput = false;
 
 	const warn = (ctx: ExtensionContext | null, msg: string) => {
 		if (ctx?.hasUI) ctx.ui.notify(`[hooks] ${msg}`, "warning");
@@ -378,6 +380,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event, ctx) => {
 		// Slash commands and tool-ish inputs pass through untouched.
 		if (event.text.startsWith("/")) return undefined;
+		// handoff.ts's internal summary prompt is not a user prompt — a blocking
+		// UserPromptSubmit hook would swallow it and hang the handoff chain.
+		if (skipNextInput) {
+			skipNextInput = false;
+			return undefined;
+		}
 		const r = await dispatch(
 			"UserPromptSubmit",
 			"",
@@ -398,6 +406,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.events.on("pi-lab:bg-wake", () => {
 		skipNextStop = true;
+	});
+
+	pi.events.on("pi-lab:handoff-turn", () => {
+		skipNextInput = true;
+		skipNextStop = true; // the summary turn's agent_end is internal too
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
