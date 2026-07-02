@@ -48,7 +48,7 @@ import { isSafeCommand } from "./plan-mode/utils.js";
 
 type Mode = "ask" | "accept-edits" | "auto" | "bypass";
 const MODES: Mode[] = ["ask", "accept-edits", "auto", "bypass"];
-const READ_TOOLS = new Set(["read", "grep", "find", "ls", "questionnaire", "todo"]);
+const READ_TOOLS = new Set(["read", "grep", "find", "ls", "questionnaire", "todo", "task_output", "task_kill"]);
 const EDIT_TOOLS = new Set(["edit", "write"]);
 
 // Claude's acceptEdits also auto-approves simple file-shuffling commands.
@@ -237,8 +237,9 @@ export default function (pi: ExtensionAPI) {
 			return prompt(ctx, `edit:${path}`, `${tool} ${path}`, "Allow this file change?");
 		}
 
-		// Bash
-		if (tool === "bash") {
+		// Bash (bash_background carries the same command surface — same gating path,
+		// shared per-command memory key, so approving a command covers both variants)
+		if (tool === "bash" || tool === "bash_background") {
 			const command = ((event.input as { command?: string }).command ?? "").trim();
 			if (isSafeCommand(command)) return undefined; // read-only allowlist
 			if (mode === "accept-edits" && SAFE_FS_RE.test(command)) return undefined;

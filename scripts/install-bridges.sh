@@ -91,6 +91,9 @@ _linked=0; _skipped=0; _collisions=0
 for plugin_skills_dir in "$HOME"/.claude/plugins/marketplaces/*/plugins/*/skills \
                          "$HOME"/.claude/plugins/marketplaces/*/external_plugins/*/skills; do
   [ -d "$plugin_skills_dir" ] || continue
+  # superpowers is wired in whole as a pi package (step 2b) — per-skill symlinks
+  # here would dual-load its 14 skills if it ever appears under marketplaces/.
+  case "$(basename "$(dirname "$plugin_skills_dir")")" in superpowers) continue ;; esac
   for skill_dir in "$plugin_skills_dir"/*/; do
     skill_md="${skill_dir%/}/SKILL.md"
     [ -f "$skill_md" ] || continue
@@ -103,6 +106,61 @@ for plugin_skills_dir in "$HOME"/.claude/plugins/marketplaces/*/plugins/*/skills
   done
 done
 echo "linked: $_linked plugin skills (skipped $_skipped no-description, $_collisions collisions)"
+
+# 2b. Superpowers as a native pi package.
+#     The superpowers Claude plugin ships first-class pi support (package.json
+#     "pi" key -> .pi/extensions/superpowers.ts + skills/), so we load it as a
+#     whole pi package instead of symlinking its skills individually — that way
+#     we also get its session-start bootstrap injection. The Claude plugin cache
+#     path is versioned, so a stable symlink absorbs updates: re-run this script
+#     after a plugin update and the link repoints.
+#     ORDER MATTERS: the package is inserted BEFORE pi-lab in settings.packages
+#     so pi-lab's superpowers-guard `context` handler runs after superpowers'
+#     injector and can strip the bootstrap from subagent/bot prompts.
+PI_PKG="$HOME/.pi/agent/pkg"
+sp_path="$(python3 - <<'PYEOF'
+import json, os
+path = ""
+try:
+    reg = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+    entries = json.load(open(reg))["plugins"]["superpowers@claude-plugins-official"]
+    for e in entries:
+        p = e.get("installPath", "")
+        if p and os.path.isdir(p):
+            path = p
+            break
+except Exception:
+    pass
+if not path:
+    cache = os.path.expanduser("~/.claude/plugins/cache/claude-plugins-official/superpowers")
+    if os.path.isdir(cache):
+        def vkey(v):
+            return [int(x) if x.isdigit() else -1 for x in v.split(".")]
+        versions = sorted((d for d in os.listdir(cache) if os.path.isdir(os.path.join(cache, d))), key=vkey)
+        if versions:
+            path = os.path.join(cache, versions[-1])
+print(path)
+PYEOF
+)"
+if [ -n "$sp_path" ] && [ -f "$sp_path/package.json" ]; then
+  mkdir -p "$PI_PKG"
+  ln -sfn "$sp_path" "$PI_PKG/superpowers"
+  python3 - <<'PYEOF'
+import json, os
+p = os.path.expanduser("~/.pi/agent/settings.json")
+d = json.load(open(p)) if os.path.exists(p) else {}
+pkgs = d.setdefault("packages", [])
+entry = "pkg/superpowers"  # relative to ~/.pi/agent, same convention as ../../pi-lab
+if entry not in pkgs:
+    pkgs.insert(0, entry)  # before pi-lab: superpowers-guard must run after the injector
+    with open(p, "w") as f:
+        json.dump(d, f, indent=2)
+    print("settings.json: packages += pkg/superpowers (inserted before pi-lab)")
+PYEOF
+  echo "superpowers: pi package -> $sp_path"
+else
+  echo "superpowers: plugin not installed; skipped"
+fi
 
 # 3. Crow skills with proper frontmatter — one dir per skill so name matches parent dir.
 #    Skip files lacking `description:` (Crow's heading-style format — pi can't load them).

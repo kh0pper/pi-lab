@@ -123,7 +123,7 @@ function botPolicyGate(
 			reason: `external_send=draft_only — ${event.toolName} would send external mail; create a draft instead.`,
 		};
 	}
-	if (event.toolName === "bash") {
+	if (event.toolName === "bash" || event.toolName === "bash_background") {
 		const command = (event.input as { command?: string }).command ?? "";
 		const d = bashDecision(command, policy);
 		if (d.block) return { block: true, reason: d.reason as string };
@@ -203,6 +203,11 @@ const SENSITIVE_PATH_PATTERNS: Array<{ test: (p: string) => boolean; label: stri
 	{ test: (p) => /(^|\/)\.pgpass$/.test(p), label: ".pgpass" },
 	{ test: (p) => /(^|\/)\.netrc$/.test(p), label: ".netrc" },
 	{ test: (p) => /(^|\/)credentials(\.|$)/i.test(basename(p)), label: "credentials file" },
+	// pi's own settings hold the declarative hooks config (extensions/hooks.ts) —
+	// an unguarded write here would let the model plant a shell hook that runs
+	// ungated on the next tool call (hooks snapshot at session start, but the
+	// next session would execute it).
+	{ test: (p) => resolve(p).endsWith("/.pi/agent/settings.json"), label: "pi settings.json (hooks config)" },
 	{ test: (p) => p.startsWith("/etc/"), label: "/etc/" },
 	{ test: (p) => p.startsWith("/usr/"), label: "/usr/" },
 	{ test: (p) => p.startsWith("/root/"), label: "/root/" },
@@ -257,8 +262,8 @@ export default function (pi: ExtensionAPI) {
 			if (decision) return decision;
 		}
 
-		// --- Bash ---
-		if (event.toolName === "bash") {
+		// --- Bash (including background variant — same command surface) ---
+		if (event.toolName === "bash" || event.toolName === "bash_background") {
 			const command = (event.input as { command?: string }).command ?? "";
 			const matched = matchDestructiveBash(command);
 			if (!matched) return undefined;
