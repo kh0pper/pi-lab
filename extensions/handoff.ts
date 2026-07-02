@@ -379,6 +379,14 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("[handoff] already in progress", "warning");
 				return;
 			}
+			// A running tournament (checkpoint suspension) is working from this
+			// conversation — clearing it mid-run would pull the rug out.
+			const cpStatus: { suspended?: boolean } = {};
+			pi.events.emit("pi-lab:checkpoint-status", cpStatus);
+			if (cpStatus.suspended) {
+				ctx.ui.notify("[handoff] a tournament is in progress — try again when it finishes", "warning");
+				return;
+			}
 			const hasAssistant = branchMessages(ctx).some((m) => m.role === "assistant" && m.text.trim());
 			if (!hasAssistant) {
 				ctx.ui.notify("[handoff] nothing to hand off — starting a blank session", "info");
@@ -493,5 +501,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", (_event, ctx) => {
 		lastCtx = ctx;
+	});
+
+	// Mutual exclusion with the tournament (D5): it must not clear the very
+	// conversation it is working from. Synchronous mutable-payload query.
+	pi.events.on("pi-lab:handoff-status", (payload: unknown) => {
+		(payload as { pending?: boolean }).pending = pendingHandoff;
 	});
 }

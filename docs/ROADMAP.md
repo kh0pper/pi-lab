@@ -1,55 +1,57 @@
 # pi-lab roadmap
 
-Deferred work with its prerequisites. Each item was design-reviewed 2026-07-02
-(see the plan review notes in `docs/research/task-decomposition-2026-07.md` for the
-evidence) and deferred deliberately — NOT dropped. **Both must land as automatic
-defaults, not manual commands** (user requirement).
+## LANDED 2026-07-02 (second long-horizon round)
 
-## D4 — Failure-triggered recursive decomposition (research rank 4)
+### D4 — failure-triggered recursive decomposition ✅
+Chain legs carry a fenced ```verdict contract (fail-open — `extensions/subagent/verdict.ts`);
+on explicit `ok:false` / hard error / double-budget-kill the local `splitter` agent splits the
+step 2–4 ways and the same agent executes the sub-steps (one structural recursion level,
+`subagent.decomposeMaxExtraLegs` cap, `toolsOverride` propagated). **Automatic default**
+(`subagent.decomposeOnFailure: true`). Telemetry: `~/.pi/agent/decompose-log.jsonl` —
+`outcome:"rescued"` rates tell us whether decomposition earns its keep.
 
-Decompose a chain step ONLY when the executor fails it; deeper splitting for weaker
-executors. Must become the DEFAULT chain retry policy.
+### D5 — best-of-N tournament (Phases 0–3) ✅ machinery / ⏳ auto-default
+- Phase 0: critic-quality telemetry (`~/.pi/agent/critic-telemetry.jsonl`) accumulates from
+  every /critique run (verdicts, inter-critic agreement, diff stats, userSentFindings human
+  label, prior-run linkage).
+- Phases 1–2: `pi-lab:checkpoint-*` bus API + `/tournament [k] <task>` (checkpoint-suspended
+  attempts, shadow-diff critic scoring via `critiqueArtifact`, exact ranking tuple, binary
+  patch apply with 3-way + confirm fallbacks).
+- Phase 3: auto-trigger on failed post-plan auto-critique — **`tournament.auto` default FALSE**.
+  Single-shot terminal state: tournament-sourced verdicts never re-trigger; residual fails
+  surface in the summary only.
 
-Prerequisites surfaced in review:
-- **Worker failure-verdict protocol** — today only critics emit parseable verdicts;
-  `getFinalOutput()` is the entire inter-leg contract. Without a defined, parseable
-  failure signal (plus prompt changes to worker/editor agents), the decompose trigger
-  never fires. Spec fail-open/fail-closed behavior.
-- Retry policy lives in the chain loop in `extensions/subagent/index.ts` (~lines 258–310
-  pre-round; search for the chain executor), NOT run.ts.
-- `{previous}` semantics after a split: step N+1 receives the LAST sub-step's output.
-- One-recursion-level flag per step + a GLOBAL expansion cap (2–4 sub-steps × several
-  failing steps balloons a 5-step chain).
+**THE FLIP CRITERION (the remaining step to full "automatic by default")**
+After ≥30 telemetry rows from normal use, review them (plus ~10 raw critic outputs) and check:
+1. inter-critic disagreement < 20% (`agree:false` rate, 2-parsed-verdict runs)
+2. ≥70% of failed-runs-with-followup flip to pass on overlapping files (`prior` linkage)
+3. `userSentFindings:false` on < 30% of failed runs (false-positive proxy)
+4. `parseError` rate < 10%
 
-## D5 — Best-of-N step tournament (research rank 2 — biggest measured gains)
+All four hold → flip `tournament.auto` default to true in `extensions/tournament.ts` (one line),
+record the evidence here. jq starters:
+`jq -s '[.[] | select(.verdicts|length==2)] | (map(select(.agree==false))|length) / length' ~/.pi/agent/critic-telemetry.jsonl`
 
-Sequential best-of-N: checkpoint → attempt → critics score → rewind → next attempt →
-re-apply the winner's diff. Auto-triggered (critic-fail or hard-step heuristic), not
-command-only.
+## Still open
 
-Prerequisites surfaced in review:
-- **Shared checkpoint access path** (`pi-lab:checkpoint-*` bus API) — a second ShadowGit
-  instance on the same gitDir bypasses the per-instance mutex and races the checkpoint
-  extension. Tournament must also suspend checkpoint arming for its duration.
-- Diff capture in the SHADOW repo (`git diff --binary startSha..endSha`) — captures
-  untracked files; clean-apply-by-construction after reset; excluded paths documented
-  as invisible.
-- Reuse the /rewind background-task confirm; handle redo-record noise (k attempts = k
-  redo entries); progress UX (`ctx.ui.notify` + `command_result` per phase — k attempts
-  on local models ≈ 15–40 min).
-- **Gate on verifier quality**: first instrument critic-score vs eventual-outcome
-  telemetry (from normal /critique use) to confirm local critics can guide search
-  (research open question #2). If they can't, tournament is wasted compute.
+### Confucius-schema compaction (research rank 7) — blocked on upstream
+pi v0.74.2's auto-compaction accepts no custom instructions from extensions
+(`customInstructions: undefined` hard-coded; `SessionBeforeCompactResult` has no instruction
+field). Options when revisited: upstream PR for instruction pass-through, or full compaction
+takeover (own LLM call). Error-scrubbing of persisted state landed as the interim.
 
-## Also blocked-on-upstream
+### ctx.newSession() TUI wedge — retest after node ≥ 22.19 upgrade
+Extension-initiated session replacement permanently wedges the interactive input loop on
+pi 0.74.2 once the session has completed turns (see CLAUDE.md Don't-break). `/clear` and
+`/handoff` use navigateTree instead. When the lab upgrades node (pi ≥ 0.75 requires 22.19),
+retest and consider restoring true new-session semantics for /handoff.
 
-- **Confucius-schema compaction** (research rank 7): pi's auto-compaction accepts no
-  custom instructions from extensions (verified v0.74.2). Options when revisited:
-  upstream PR for instruction pass-through, or full compaction takeover (own LLM call).
+### D1 v2 (small)
+- Blocking/revert edit gate (the variant the SWE-agent evidence measured) — needs checkpoint
+  coordination for cheap revert.
+- TypeScript checker when node ≥ 22.6 (`--experimental-strip-types`) or a fast TS parser.
 
-## D1 v2 (small)
-
-- Blocking/revert edit gate (the variant the SWE-agent evidence actually measured) —
-  needs coordination with checkpoint for cheap revert.
-- TypeScript checker when the lab's node ≥ 22.6 (`--experimental-strip-types`) or a
-  fast external TS parser lands.
+### Future tournament hooks (documented, not built)
+- `[HARD]` marker on a plan step routing that step through /tournament from the plan executor.
+- Re-tournamenting a whole plan from its pre-execution checkpoint (needs reliable
+  pre-execution checkpoint identification).

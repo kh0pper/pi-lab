@@ -43,6 +43,10 @@ export interface SingleResult {
 	step?: number;
 	/** Set when the leg was killed for exceeding maxTurns (distinct from abort). */
 	budgetExceeded?: boolean;
+	/** Decompose sub-steps render as "2.1", "2.2" (D4). */
+	stepLabel?: string;
+	/** Set on a failed leg that was split into sub-steps (D4). */
+	decomposed?: boolean;
 }
 
 export interface SubagentDetails {
@@ -138,10 +142,11 @@ export async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	toolsOverride?: string[],
 	// Optional per-leg turn budget (research: abort-and-retry-fresh beats grinding —
-	// successful agent runs are short; failures grind long). Passed ONLY by the
-	// subagent tool's executor. Critics and other direct callers pass nothing and
-	// are never budget-killed (a killed critic = missing fenced verdict = failed
-	// review, fail-closed).
+	// successful agent runs are short; failures grind long). Passed by the subagent
+	// tool's executor and the tournament's attempt runner. THE INVARIANT THAT
+	// MATTERS: critics call runSingleAgent with NO budget and are never
+	// budget-killed (a killed critic = missing fenced verdict = failed review,
+	// fail-closed).
 	maxTurns?: number,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
@@ -239,7 +244,11 @@ export async function runSingleAgent(
 
 					if (msg.role === "assistant") {
 						currentResult.usage.turns++;
-						if (maxTurns && currentResult.usage.turns >= maxTurns && !currentResult.budgetExceeded) {
+						// Strictly GREATER: a leg that finishes on its final allowed turn
+						// is a success — budget-exceeded means "killed while still going",
+						// never "completed on the boundary" (found live: 2-turn sub-legs
+						// finishing on turn 2 were wrongly failed).
+						if (maxTurns && currentResult.usage.turns > maxTurns && !currentResult.budgetExceeded) {
 							currentResult.budgetExceeded = true;
 							proc.kill("SIGTERM");
 							setTimeout(() => {

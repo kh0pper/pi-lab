@@ -29,22 +29,51 @@ import {
 	type SingleResult,
 	type SubagentDetails,
 } from "./run.js";
+import { parseLegVerdict, parseNumberedList, stripVerdictBlocks, VERDICT_INSTRUCTION } from "./verdict.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 
-/** settings.subagent.maxStepsPerLeg — per-leg turn budget (0/absent = unlimited). */
-function maxStepsPerLeg(): number | undefined {
+interface SubagentSettings {
+	maxStepsPerLeg?: number;
+	decomposeOnFailure?: boolean;
+	decomposeMaxExtraLegs?: number;
+}
+
+function subagentSettings(): SubagentSettings {
 	try {
 		const raw = JSON.parse(
 			fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "settings.json"), "utf8"),
-		) as { subagent?: { maxStepsPerLeg?: number } };
-		const n = raw.subagent?.maxStepsPerLeg;
-		return typeof n === "number" && n > 0 ? n : 24; // generous default: abort-and-retry beats grinding
+		) as { subagent?: SubagentSettings };
+		return raw.subagent ?? {};
 	} catch {
-		return 24;
+		return {};
 	}
+}
+
+/** settings.subagent.maxStepsPerLeg — per-leg turn budget (0/absent = unlimited). */
+function maxStepsPerLeg(): number | undefined {
+	const n = subagentSettings().maxStepsPerLeg;
+	return typeof n === "number" && n > 0 ? n : 24; // generous default: abort-and-retry beats grinding
+}
+
+/** Best-effort decompose telemetry — answers "does decomposition rescue legs?" */
+function logDecompose(row: Record<string, unknown>): void {
+	try {
+		const p = path.join(os.homedir(), ".pi", "agent", "decompose-log.jsonl");
+		fs.appendFileSync(p, `${JSON.stringify({ ts: Date.now(), cwd: process.cwd(), ...row })}\n`);
+		const lines = fs.readFileSync(p, "utf8").split("\n");
+		if (lines.length > 2000) fs.writeFileSync(p, lines.slice(-1000).join("\n"));
+	} catch {
+		// telemetry must never break a chain
+	}
+}
+
+/** Scrub failure evidence to a one-liner (models self-condition on error dumps). */
+function scrubEvidence(s: string): string {
+	const flat = s.replace(/\s+/g, " ").trim();
+	return flat.length > 160 ? `${flat.slice(0, 157)}…` : flat;
 }
 
 /**
@@ -308,10 +337,48 @@ export default function (pi: ExtensionAPI) {
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
 				let previousOutput = "";
+				const cfg = subagentSettings();
+				const decomposeOn = cfg.decomposeOnFailure !== false;
+				const maxExtraLegs = typeof cfg.decomposeMaxExtraLegs === "number" ? cfg.decomposeMaxExtraLegs : 6;
+				let extraLegsUsed = 0;
+
+				// Concatenate ALL text parts of the final assistant message — a verdict
+				// in a second text part must not vanish into fail-open (review fix).
+				const fullFinalText = (r: SingleResult): string => {
+					for (let m = r.messages.length - 1; m >= 0; m--) {
+						const msg = r.messages[m] as { role?: string; content?: Array<{ type?: string; text?: string }> };
+						if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+						const text = msg.content
+							.filter((p) => p?.type === "text" && typeof p.text === "string")
+							.map((p) => p.text)
+							.join("\n");
+						if (text.trim()) return text;
+					}
+					return "";
+				};
+
+				const chainError = (stepNo: number, agentName: string, r: SingleResult) => {
+					const errorMsg = r.errorMessage || r.stderr || getFinalOutput(r.messages) || "(no output)";
+					return {
+						content: [{ type: "text" as const, text: `Chain stopped at step ${stepNo} (${agentName}): ${errorMsg}` }],
+						details: makeDetails("chain")(results),
+						isError: true,
+					};
+				};
+
+				const legFailed = (r: SingleResult): { failed: boolean; hard: boolean; reason: string } => {
+					const hard = r.exitCode !== 0 || r.stopReason === "error";
+					if (hard) return { failed: true, hard: true, reason: r.errorMessage || r.stderr || "hard error" };
+					if (!decomposeOn) return { failed: false, hard: false, reason: "" };
+					const v = parseLegVerdict(fullFinalText(r));
+					if (v.found && !v.ok) return { failed: true, hard: false, reason: v.reason ?? "verdict: not ok" };
+					return { failed: false, hard: false, reason: "" };
+				};
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					let taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					if (decomposeOn) taskWithContext += VERDICT_INSTRUCTION;
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -342,21 +409,95 @@ export default function (pi: ExtensionAPI) {
 					);
 					results.push(result);
 
-					const isError =
-						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-					if (isError) {
-						const errorMsg =
-							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
+					const aborted = result.stopReason === "aborted";
+					const configError = (result.stderr || "").startsWith("Unknown agent");
+					const fail = legFailed(result);
+
+					if (!fail.failed && !aborted) {
+						previousOutput = stripVerdictBlocks(getFinalOutput(result.messages));
+						continue;
 					}
-					previousOutput = getFinalOutput(result.messages);
+
+					// ---- decompose gate (chains only; one structural recursion level) ----
+					if (aborted || !decomposeOn || configError || extraLegsUsed + 2 > maxExtraLegs) {
+						logDecompose({
+							step: i + 1,
+							agent: step.agent,
+							trigger: fail.hard ? "exit" : "verdict",
+							reason: scrubEvidence(fail.reason),
+							outcome: aborted ? "aborted" : !decomposeOn ? "disabled" : configError ? "config-error" : "cap-reached",
+						});
+						return chainError(i + 1, step.agent, result);
+					}
+
+					const evidence = scrubEvidence(fail.reason || fullFinalText(result));
+					const splitPrompt =
+						`A chain step failed and must be split. Failed step (agent: ${step.agent}):\n` +
+						`${taskWithContext.slice(0, 4000)}\n\nFailure evidence: ${evidence}\n\n` +
+						`Split it into 2-4 smaller sub-steps that together accomplish the original step; ` +
+						`each must be independently executable by the same agent in a few tool calls. ` +
+						`Output ONLY a numbered list (1. ... 4.), one sub-step per line, no preamble.`;
+					// splitter + sub-legs: runSingleAgent with the budget directly, NO retry —
+					// decompose IS the retry. toolsOverride propagates (plan-mode read-only).
+					const split = await runSingleAgent(
+						ctx.cwd, agents, "splitter", splitPrompt, step.cwd, i + 1, signal,
+						chainUpdate, makeDetails("chain"), params.toolsOverride, maxStepsPerLeg(),
+					);
+					// fullFinalText, not getFinalOutput: the list may live in a later
+					// text part of the final message (same multi-part trap as verdicts).
+					const subTasks = parseNumberedList(fullFinalText(split)).slice(
+						0,
+						Math.min(4, maxExtraLegs - extraLegsUsed),
+					);
+					if (split.exitCode !== 0 || split.stopReason === "error" || subTasks.length < 2) {
+						logDecompose({
+							step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
+							reason: evidence, outcome: "split-unparseable",
+						});
+						return chainError(i + 1, step.agent, result);
+					}
+
+					result.decomposed = true;
+					let subPrev = previousOutput; // sub-step 1 sees the ORIGINAL {previous}
+					let rescued = true;
+					for (let k = 0; k < subTasks.length; k++) {
+						let subTask =
+							`${subTasks[k]}\n\nOriginal goal (this is one part of it): ${step.task.slice(0, 500)}` +
+							(subPrev ? `\n\nContext from earlier work:\n${subPrev}` : "");
+						if (decomposeOn) subTask += VERDICT_INSTRUCTION;
+						const r = await runSingleAgent(
+							ctx.cwd, agents, step.agent, subTask, step.cwd, i + 1, signal,
+							chainUpdate, makeDetails("chain"), params.toolsOverride, maxStepsPerLeg(),
+						);
+						r.stepLabel = `${i + 1}.${k + 1}`;
+						results.push(r);
+						extraLegsUsed++;
+						const subFail = legFailed(r);
+						if (subFail.failed || r.stopReason === "aborted" || r.budgetExceeded) {
+							logDecompose({
+								step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
+								reason: evidence, subStepCount: subTasks.length, outcome: "sub-step-failed",
+							});
+							rescued = false;
+							return chainError(i + 1, step.agent, r);
+						}
+						subPrev = stripVerdictBlocks(getFinalOutput(r.messages));
+					}
+					if (rescued) {
+						logDecompose({
+							step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
+							reason: evidence, subStepCount: subTasks.length, outcome: "rescued",
+						});
+						previousOutput = subPrev; // step N+1 sees the LAST sub-step's output
+					}
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text: stripVerdictBlocks(getFinalOutput(results[results.length - 1].messages)) || "(no output)",
+						},
+					],
 					details: makeDetails("chain")(results),
 				};
 			}
@@ -644,7 +785,7 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
+								`${theme.fg("muted", `─── Step ${r.stepLabel ?? r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}${r.decomposed ? theme.fg("warning", " → split into sub-steps") : ""}`,
 								0,
 								0,
 							),
@@ -691,7 +832,7 @@ export default function (pi: ExtensionAPI) {
 				for (const r of details.results) {
 					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+					text += `\n\n${theme.fg("muted", `─── Step ${r.stepLabel ?? r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}${r.decomposed ? theme.fg("warning", " → split into sub-steps") : ""}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}

@@ -34,6 +34,7 @@
  * (PIBOT_SUBAGENT_DEPTH >= 1).
  */
 
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -100,6 +101,21 @@ export default function (pi: ExtensionAPI) {
 	let disabledForSession = false;
 	let warnedPathological = false;
 	let lastCtx: ExtensionContext | null = null;
+
+	// Tournament suspension (D5): while suspended, arming stops and /rewind
+	// refuses. Token-matched resume; safety timer + session boundaries clear it.
+	let suspended = false;
+	let suspendToken = "";
+	let suspendTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function clearSuspension(): void {
+		suspended = false;
+		suspendToken = "";
+		if (suspendTimer) {
+			clearTimeout(suspendTimer);
+			suspendTimer = null;
+		}
+	}
 
 	function indexPath(): string {
 		return join(checkpointsRoot, sessionId, "index.json");
@@ -175,6 +191,10 @@ export default function (pi: ExtensionAPI) {
 		const anchor = findAnchor(ctx);
 		try {
 			const sha = await getShadow().snapshot(anchor.label);
+			// Re-check AFTER the awaited snapshot: a tournament suspend that landed
+			// while this was in flight must not get a visible index record of an
+			// attempt-mutated tree (the snapshot itself is harmless — ref-pinned).
+			if (suspended) return;
 			const records = readIndex();
 			// Same sha as the latest record = nothing changed since; still record it
 			// so each prompt has a rewind point, but dedupe consecutive identical shas.
@@ -226,15 +246,20 @@ export default function (pi: ExtensionAPI) {
 		shadow = null; // re-derive (fork/new give a fresh session id)
 		disabledForSession = false;
 		failures = 0;
+		clearSuspension(); // a wedged suspend must not outlive its session
 		purgeStale();
 	});
 
+	pi.on("session_shutdown", () => {
+		clearSuspension();
+	});
+
 	pi.on("agent_start", () => {
-		armed = !disabledForSession && loadConfig().enabled !== false && sessionId !== "";
+		armed = !suspended && !disabledForSession && loadConfig().enabled !== false && sessionId !== "";
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		if (!armed) return undefined;
+		if (!armed || suspended) return undefined;
 		const mutating = new Set([...BASE_MUTATING_TOOLS, ...(loadConfig().mutatingTools ?? [])]);
 		if (!mutating.has(event.toolName)) return undefined;
 		armed = false;
@@ -243,7 +268,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("user_bash", async (_event, ctx) => {
-		if (!armed) return undefined;
+		if (!armed || suspended) return undefined;
 		armed = false;
 		await takeCheckpoint(ctx);
 		return undefined;
@@ -274,6 +299,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("rewind", {
 		description: "Rewind files and/or conversation to a checkpoint",
 		handler: async (_args, ctx: ExtensionCommandContext) => {
+			if (suspended) {
+				ctx.ui.notify("[checkpoint] a tournament is in progress — /rewind is disabled until it finishes", "warning");
+				return;
+			}
 			const records = readIndex();
 			if (records.length === 0) {
 				ctx.ui.notify("[checkpoint] no checkpoints in this session yet", "info");
@@ -394,4 +423,120 @@ export default function (pi: ExtensionAPI) {
 		lastCtx = ctx;
 	});
 	void lastCtx;
+
+	// -------------------------------------------------------------------------
+	// pi-lab:checkpoint-* bus API (D5) — the ONLY sanctioned cross-extension
+	// access to the shadow repo. All calls route through this module's single
+	// ShadowGit instance (its per-instance mutex serializes against arming
+	// snapshots); a second instance on the same gitDir would bypass the mutex.
+	// Mutable-payload pattern: async ops set payload.promise; an unset promise
+	// means REFUSED and the caller must abort. Emitters are in-process extension
+	// code only (the model/hooks/web cannot emit arbitrary bus events).
+	// `internal: true` snapshots/restores pin refs but write NO index.json
+	// records — a k-attempt tournament leaves exactly 2 visible /rewind entries.
+	// -------------------------------------------------------------------------
+
+	pi.events.on("pi-lab:checkpoint-status", (payload: unknown) => {
+		const p = payload as {
+			ok?: boolean;
+			sessionId?: string;
+			cwd?: string;
+			disabled?: boolean;
+			suspended?: boolean;
+			pathologicalCwd?: boolean;
+		};
+		p.ok = sessionId !== "" && loadConfig().enabled !== false;
+		p.sessionId = sessionId;
+		p.cwd = sessionCwd;
+		p.disabled = disabledForSession;
+		p.suspended = suspended;
+		p.pathologicalCwd = isPathologicalCwd();
+	});
+
+	pi.events.on("pi-lab:checkpoint-snapshot", (payload: unknown) => {
+		const p = payload as { label?: string; internal?: boolean; promise?: Promise<{ sha: string }> };
+		if (sessionId === "" || disabledForSession || isPathologicalCwd()) return;
+		const label = p.label ?? "bus snapshot";
+		p.promise = getShadow()
+			.snapshot(label)
+			.then((sha) => {
+				if (!p.internal) {
+					const records = readIndex();
+					if (records.length === 0 || records[records.length - 1].sha !== sha) {
+						records.push({ sha, ts: Date.now(), userEntryId: null, label });
+						writeIndex(records);
+					}
+				}
+				return { sha };
+			});
+	});
+
+	pi.events.on("pi-lab:checkpoint-restore", (payload: unknown) => {
+		const p = payload as { sha?: string; internal?: boolean; promise?: Promise<{ safetySha: string }> };
+		if (sessionId === "" || disabledForSession || !p.sha) return;
+		const sha = p.sha;
+		p.promise = getShadow()
+			.restore(sha)
+			.then(({ safetySha }) => {
+				if (!p.internal) {
+					const records = readIndex();
+					records.push({ sha: safetySha, ts: Date.now(), userEntryId: null, label: "pre-rewind (redo point)" });
+					writeIndex(records);
+				}
+				return { safetySha };
+			});
+	});
+
+	pi.events.on("pi-lab:checkpoint-diff", (payload: unknown) => {
+		const p = payload as {
+			fromSha?: string;
+			toSha?: string;
+			binary?: boolean;
+			promise?: Promise<{ patch: string; files: number; insertions: number; deletions: number; fileList: string[] }>;
+		};
+		if (sessionId === "" || !p.fromSha || !p.toSha) return;
+		const { fromSha, toSha } = p;
+		p.promise = (async () => {
+			const stats = await getShadow().diffNumstat(fromSha, toSha);
+			const patch = p.binary
+				? await getShadow().diffBinary(fromSha, toSha)
+				: await getShadow().diffText(fromSha, toSha);
+			return { patch, ...stats };
+		})();
+	});
+
+	pi.events.on("pi-lab:checkpoint-apply", (payload: unknown) => {
+		const p = payload as { patch?: string; threeWay?: boolean; promise?: Promise<{ ok: boolean; stderr: string }> };
+		if (sessionId === "" || !p.patch) return;
+		p.promise = getShadow().applyPatch(p.patch, { threeWay: p.threeWay });
+	});
+
+	pi.events.on("pi-lab:checkpoint-suspend", (payload: unknown) => {
+		const p = payload as { reason?: string; maxMinutes?: number; ok?: boolean; token?: string };
+		if (suspended) {
+			p.ok = false;
+			return;
+		}
+		suspended = true;
+		suspendToken = randomBytes(8).toString("hex");
+		const maxMs = Math.min(p.maxMinutes ?? 90, 240) * 60_000;
+		suspendTimer = setTimeout(() => {
+			clearSuspension();
+			if (lastCtx?.hasUI)
+				lastCtx.ui.notify(`[checkpoint] suspension (${p.reason ?? "?"}) hit its ${maxMs / 60000}m safety cap — arming resumed`, "warning");
+		}, maxMs);
+		suspendTimer.unref?.();
+		p.ok = true;
+		p.token = suspendToken;
+	});
+
+	pi.events.on("pi-lab:checkpoint-resume", (payload: unknown) => {
+		const p = payload as { token?: string; ok?: boolean };
+		if (!suspended || p.token !== suspendToken) {
+			p.ok = false;
+			return;
+		}
+		clearSuspension();
+		p.ok = true;
+	});
 }

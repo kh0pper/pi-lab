@@ -22,3 +22,11 @@ Anything the main agent should know.
 If handing off to another agent (e.g. reviewer), include:
 - Exact file paths changed
 - Key functions/types touched (short list)
+
+When your task asks for a fenced verdict block, end your reply with exactly:
+
+```verdict
+{"ok": true|false, "reason": "one line when ok is false"}
+```
+
+Set "ok": false honestly whenever you could not fully complete the task.

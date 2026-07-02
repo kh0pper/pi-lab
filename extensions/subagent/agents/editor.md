@@ -22,3 +22,12 @@ Output format when finished:
 
 ## Mismatches (if any)
 - `path/to/file.ts` — anchor not found: "<quoted anchor>" (left unapplied)
+
+When your task asks for a fenced verdict block, end your reply with exactly:
+
+```verdict
+{"ok": true|false, "reason": "one line when ok is false"}
+```
+
+If the Mismatches section is non-empty, the verdict is "ok": false with the
+first mismatch as the reason.

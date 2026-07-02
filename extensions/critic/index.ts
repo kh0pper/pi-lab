@@ -29,12 +29,14 @@
  *   }
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { discoverAgents } from "../subagent/agents.js";
 import { getFinalOutput, runSingleAgent, type SingleResult, type SubagentDetails } from "../subagent/run.js";
+
+const TELEMETRY_PATH = resolve(homedir(), ".pi", "agent", "critic-telemetry.jsonl");
 
 interface CriticConfig {
 	enabled?: boolean;
@@ -121,6 +123,161 @@ export function parseVerdict(output: string): Verdict {
 	return { passed: false, findings: [], parseError: "no parseable verdict JSON in critic output" };
 }
 
+// ---------------------------------------------------------------------------
+// Telemetry (D5 Phase 0) — feeds the tournament.auto flip decision.
+// Rows are self-contained; analysis is offline (jq). Best-effort: telemetry
+// must never break a critique. File capped at append time (~2000 → last 1000).
+// ---------------------------------------------------------------------------
+
+export interface CritiqueTelemetryRow {
+	v: 1;
+	ts: number;
+	cwd: string;
+	source: "manual" | "auto" | "tournament";
+	ref: string;
+	modelOverride: string | null;
+	diff: { files: number; insertions: number; deletions: number; bytes: number; oversized: boolean } | null;
+	verdicts: Array<{
+		agent: string;
+		passed: boolean;
+		blockers: number;
+		warns: number;
+		parseError: string | null;
+		firstBlocker?: string;
+	}>;
+	agree: boolean;
+	userSentFindings: boolean | null;
+	prior: { ts: number; passed: boolean; filesOverlap: number } | null;
+	changedFiles?: string[];
+	tournamentId?: string;
+	pickedWinner?: boolean;
+}
+
+/** Find the most recent same-cwd row within 4h for outcome linkage. */
+function findPrior(cwd: string, changedFiles: string[]): CritiqueTelemetryRow["prior"] {
+	try {
+		const lines = readFileSync(TELEMETRY_PATH, "utf8").trim().split("\n");
+		for (let i = lines.length - 1; i >= 0 && i >= lines.length - 200; i--) {
+			const row = JSON.parse(lines[i]) as CritiqueTelemetryRow;
+			if (row.cwd !== cwd) continue;
+			if (Date.now() - row.ts > 4 * 3600_000) break;
+			const overlap = (row.changedFiles ?? []).filter((f) => changedFiles.includes(f)).length;
+			return { ts: row.ts, passed: row.verdicts.every((x) => x.passed), filesOverlap: overlap };
+		}
+	} catch {
+		// no file / malformed tail — no prior
+	}
+	return null;
+}
+
+export function appendCritiqueTelemetry(row: CritiqueTelemetryRow): void {
+	try {
+		appendFileSync(TELEMETRY_PATH, `${JSON.stringify(row)}\n`);
+		const lines = readFileSync(TELEMETRY_PATH, "utf8").split("\n");
+		if (lines.length > 2000) writeFileSync(TELEMETRY_PATH, lines.slice(-1000).join("\n"));
+	} catch {
+		// best-effort
+	}
+}
+
+// ---------------------------------------------------------------------------
+// critiqueArtifact — the reusable scoring entry point (D5). Spawns the critic
+// agents on an ARBITRARY artifact (e.g. the tournament's shadow-repo diff) and
+// returns verdicts + a prepared telemetry row (caller decides when to append:
+// runCritique fills userSentFindings after its confirm; the tournament appends
+// immediately with its own fields).
+// ---------------------------------------------------------------------------
+
+export interface CritiqueArtifactParams {
+	cwd: string;
+	/** Full artifact text handed to each critic (diff, or file list + instructions). */
+	artifact: string;
+	specNote?: string;
+	source: "manual" | "auto" | "tournament";
+	criticNames?: string[];
+	modelOverride?: string;
+	/** Telemetry fields */
+	ref?: string;
+	changedFiles?: string[];
+	diffStats?: CritiqueTelemetryRow["diff"];
+}
+
+export interface CritiqueOutcome {
+	allPassed: boolean;
+	verdicts: Array<{ agent: string; verdict: Verdict; raw: string }>;
+	row: CritiqueTelemetryRow;
+}
+
+export async function critiqueArtifact(p: CritiqueArtifactParams): Promise<CritiqueOutcome | { missing: string[] }> {
+	const cfg = loadConfig();
+	const criticNames = p.criticNames ?? cfg.agents ?? ["code-critic", "test-critic"];
+	const discovered = discoverAgents(p.cwd, "user").agents;
+	const missing = criticNames.filter((n) => !discovered.some((a) => a.name === n));
+	if (missing.length > 0) return { missing };
+	const agents = p.modelOverride
+		? discovered.map((a) => (criticNames.includes(a.name) ? { ...a, forceModel: p.modelOverride } : a))
+		: discovered;
+
+	const makeDetails = (results: SingleResult[]): SubagentDetails => ({
+		mode: "parallel",
+		agentScope: "user",
+		projectAgentsDir: null,
+		results,
+	});
+	const verdictReminder =
+		"\n\nIMPORTANT: After completing your analysis, END your reply with the fenced verdict JSON block described in your instructions. The verdict block must be the LAST thing in your final message — write nothing after it. A missing verdict counts as a failed review.";
+
+	const results = await Promise.all(
+		criticNames.map((name) =>
+			runSingleAgent(
+				p.cwd, agents, name, `${p.artifact}${p.specNote ?? ""}${verdictReminder}`,
+				undefined, undefined, undefined, undefined, makeDetails,
+			),
+		),
+	);
+	const verdicts = results.map((r) => {
+		if (r.exitCode !== 0 || r.stopReason === "error") {
+			return {
+				agent: r.agent,
+				verdict: {
+					passed: false,
+					findings: [],
+					parseError: r.errorMessage || r.stderr.slice(0, 200) || "critic process failed",
+				} as Verdict,
+				raw: getFinalOutput(r.messages),
+			};
+		}
+		return { agent: r.agent, verdict: parseVerdict(getFinalOutput(r.messages)), raw: getFinalOutput(r.messages) };
+	});
+
+	const parsed = verdicts.filter((v) => !v.verdict.parseError);
+	const row: CritiqueTelemetryRow = {
+		v: 1,
+		ts: Date.now(),
+		cwd: p.cwd,
+		source: p.source,
+		ref: p.ref ?? "(artifact)",
+		modelOverride: p.modelOverride ?? null,
+		diff: p.diffStats ?? null,
+		verdicts: verdicts.map((v) => {
+			const blockers = v.verdict.findings.filter((f) => f.severity === "blocker");
+			return {
+				agent: v.agent,
+				passed: v.verdict.passed,
+				blockers: blockers.length,
+				warns: v.verdict.findings.length - blockers.length,
+				parseError: v.verdict.parseError ?? null,
+				firstBlocker: blockers[0]?.detail?.slice(0, 200),
+			};
+		}),
+		agree: parsed.length < 2 || parsed.every((v) => v.verdict.passed === parsed[0].verdict.passed),
+		userSentFindings: null,
+		prior: findPrior(p.cwd, p.changedFiles ?? []),
+		changedFiles: p.changedFiles,
+	};
+	return { allPassed: verdicts.every((v) => v.verdict.passed), verdicts, row };
+}
+
 export default function (pi: ExtensionAPI) {
 	// Bridge web-dispatched invocations ("command:critique" bus events) — they
 	// bypass registerCommand, so capture a ctx and route them to the same logic.
@@ -133,7 +290,7 @@ export default function (pi: ExtensionAPI) {
 		void runCritique((((data as { args?: string })?.args) ?? "").trim(), lastCtx);
 	});
 
-	const runCritique = async (args: string, ctx: ExtensionCommandContext) => {
+	const runCritique = async (args: string, ctx: ExtensionCommandContext, source: "manual" | "auto" = "manual") => {
 			const cfg = loadConfig();
 			if (cfg.enabled === false) {
 				ctx.ui.notify("Critic is disabled (settings.json critic.enabled)", "warning");
@@ -196,63 +353,44 @@ export default function (pi: ExtensionAPI) {
 				? `The diff is too large to inline (> ${maxDiffBytes} bytes). Changed files (${refNote}):\n${changedFiles}\n\nRun \`git diff ${ref} -- <file>\` yourself per file and review every change.`
 				: `Unified diff (${refNote}):\n\n\`\`\`diff\n${diff}\n\`\`\``;
 
-			const discovered = discoverAgents(ctx.cwd, "user").agents;
-			const missing = criticNames.filter((n) => !discovered.some((a) => a.name === n));
-			if (missing.length > 0) {
-				ctx.ui.notify(`Missing critic agents: ${missing.join(", ")} (run scripts/install-bridges.sh)`, "error");
-				return;
-			}
-			// Per-run model override: hand the runner cloned agent configs.
-			// forceModel beats settings modelOverrides inside the runner.
-			const agents = modelOverride
-				? discovered.map((a) => (criticNames.includes(a.name) ? { ...a, forceModel: modelOverride } : a))
-				: discovered;
-
 			ctx.ui.notify(
 				`Running ${criticNames.length} critics on the diff (${refNote})${modelOverride ? ` on ${modelOverride}` : ""}…`,
 				"info",
 			);
-			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
-				mode: "parallel",
-				agentScope: "user",
-				projectAgentsDir: null,
-				results,
-			});
 
-			const verdictReminder =
-				"\n\nIMPORTANT: After completing your analysis, END your reply with the fenced verdict JSON block described in your instructions. The verdict block must be the LAST thing in your final message — write nothing after it. A missing verdict counts as a failed review.";
-			const results = await Promise.all(
-				criticNames.map((name) =>
-					runSingleAgent(
-						ctx.cwd,
-						agents,
-						name,
-						`${artifact}${specNote}${verdictReminder}`,
-						undefined,
-						undefined,
-						undefined,
-						undefined,
-						makeDetails,
-					),
-				),
-			);
-
-			const verdicts = results.map((r) => {
-				if (r.exitCode !== 0 || r.stopReason === "error") {
-					return {
-						agent: r.agent,
-						verdict: {
-							passed: false,
-							findings: [],
-							parseError: r.errorMessage || r.stderr.slice(0, 200) || "critic process failed",
-						} as Verdict,
-						raw: getFinalOutput(r.messages),
-					};
+			// diff stats for telemetry (cheap numstat alongside the existing calls)
+			let diffStats: CritiqueTelemetryRow["diff"] = null;
+			try {
+				const numstat = (await pi.exec("git", ["diff", "--numstat", ref], { cwd: ctx.cwd })).stdout.trim();
+				let ins = 0;
+				let del = 0;
+				const rows = numstat ? numstat.split("\n") : [];
+				for (const line of rows) {
+					const [a, b] = line.split("\t");
+					ins += Number(a) || 0;
+					del += Number(b) || 0;
 				}
-				return { agent: r.agent, verdict: parseVerdict(getFinalOutput(r.messages)), raw: getFinalOutput(r.messages) };
-			});
+				diffStats = { files: rows.length, insertions: ins, deletions: del, bytes: Buffer.byteLength(diff, "utf8"), oversized };
+			} catch {
+				// stats optional
+			}
 
-			const allPassed = verdicts.every((v) => v.verdict.passed);
+			const outcome = await critiqueArtifact({
+				cwd: ctx.cwd,
+				artifact,
+				specNote,
+				source,
+				criticNames,
+				modelOverride,
+				ref,
+				changedFiles: changedFiles ? changedFiles.split("\n").filter(Boolean) : [],
+				diffStats,
+			});
+			if ("missing" in outcome) {
+				ctx.ui.notify(`Missing critic agents: ${outcome.missing.join(", ")} (run scripts/install-bridges.sh)`, "error");
+				return;
+			}
+			const { allPassed, verdicts, row } = outcome;
 			const lines: string[] = [`**Critique ${allPassed ? "PASSED ✓" : "FAILED ✗"}** (${refNote})`, ""];
 			for (const v of verdicts) {
 				const icon = v.verdict.passed ? "✓" : "✗";
@@ -267,7 +405,19 @@ export default function (pi: ExtensionAPI) {
 				{ triggerTurn: false },
 			);
 
-			if (!allPassed && ctx.hasUI) {
+			// D5: let listeners (the tournament auto-trigger) claim a failed
+			// auto-critique before the interactive confirm fires.
+			const busPayload = {
+				source,
+				ref,
+				passed: allPassed,
+				verdicts: row.verdicts,
+				changedFiles: row.changedFiles ?? [],
+				handled: false,
+			};
+			pi.events.emit("pi-lab:critique-verdict", busPayload);
+
+			if (!allPassed && ctx.hasUI && !busPayload.handled) {
 				// The confirm renders in the terminal — ping remote watchers so a
 				// phone user knows why the session went quiet.
 				pi.events.emit("pi-lab:attention", { reason: "critique", detail: "critics found blocking issues — confirm in terminal or reply here" });
@@ -275,6 +425,7 @@ export default function (pi: ExtensionAPI) {
 					"Critics found blocking issues",
 					"Send the findings to the agent to address?",
 				);
+				row.userSentFindings = send;
 				if (send) {
 					const findingsText = verdicts
 						.filter((v) => !v.verdict.passed)
@@ -288,6 +439,9 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			}
+			// Append AFTER the confirm (userSentFindings is the human label);
+			// passed / no-UI / handled paths append with null immediately.
+			appendCritiqueTelemetry(row);
 	};
 
 	// Auto-critique when a plan finishes executing (the long-local-flow case:
@@ -295,7 +449,7 @@ export default function (pi: ExtensionAPI) {
 	pi.events.on("plan-mode:complete", () => {
 		if (!lastCtx) return;
 		if (loadConfig().auto === false) return;
-		void runCritique("", lastCtx);
+		void runCritique("", lastCtx, "auto");
 	});
 
 	pi.registerCommand("critique", {
