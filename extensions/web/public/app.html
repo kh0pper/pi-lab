@@ -325,7 +325,7 @@
 					<div class="hdr-row">
 						<a class="hub-link" href="/" aria-label="Back to hub">${I.back}</a>
 						<span class="bird ${birdCls}">${BIRD}</span>
-						<div class="hdr-title">${agent.cwd ? agent.cwd.split("/").pop() : "pi session"}</div>
+						<div class="hdr-title">${agent.sessionName || (agent.cwd ? agent.cwd.split("/").pop() : "pi session")}</div>
 						<span style="font-size:12px;color:${attention ? "var(--attn)" : busy ? "var(--alive)" : "var(--faint)"};font-weight:600">${stateTxt}</span>
 					</div>
 					<div class="chips">
@@ -502,10 +502,23 @@
 		function Session({ status, plan, refresh, send }) {
 			useEffect(() => { refresh(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
 			const a = status?.agent ?? {}; const s = status?.system ?? {};
+			const rename = async () => {
+				const name = prompt("Session name (empty clears it):", a.sessionName || "");
+				if (name === null) return;
+				const r = await post("/session/rename", { name });
+				if (r?.error) alert(r.error); else refresh();
+			};
+			const archive = async () => {
+				const wasArchived = !!a.sessionArchived;
+				if (!wasArchived && !confirm("Archive this session? It disappears from the Perch session lists (the live session keeps running until you exit it).")) return;
+				const r = await post("/session/archive", { archived: !wasArchived });
+				if (r?.error) alert(r.error); else refresh();
+			};
 			return html`
 				<div class="pane"><div class="cards">
 					<div class="card">
 						<h3>Agent</h3>
+						<div class="kv"><span class="k">name</span><span class="v">${a.sessionName ?? "—"}${a.sessionArchived ? " (archived)" : ""}</span></div>
 						<div class="kv"><span class="k">model</span><span class="v">${a.model ?? "—"}</span></div>
 						<div class="kv"><span class="k">mode</span><span class="v">${plan?.enabled ? "plan (read-only)" : plan?.executing ? "executing plan" : "normal"}</span></div>
 						<div class="kv"><span class="k">state</span><span class="v">${a.idle === false ? "working" : "idle"}</span></div>
@@ -523,6 +536,8 @@
 							<button class="abtn primary" onClick=${() => send("/critique")}>Run critics on my diff</button>
 							<button class="abtn" onClick=${() => send("/critique frontier")}>Frontier critic review</button>
 							<button class="abtn" onClick=${() => send("/todos")}>Show todos</button>
+							<button class="abtn" onClick=${rename}>Rename session</button>
+							<button class="abtn" onClick=${archive}>${a.sessionArchived ? "Unarchive session" : "Archive session"}</button>
 						</div>
 					</div>
 				</div></div>

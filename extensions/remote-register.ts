@@ -49,9 +49,14 @@ export default function (pi: ExtensionAPI) {
 	let webStarted = false;
 	let heartbeat: ReturnType<typeof setInterval> | null = null;
 	let payload: Record<string, unknown> | null = null;
+	let nameFn: (() => string) | null = null;
 
 	async function register(): Promise<void> {
 		if (!payload) return;
+		// Re-derive the display name each beat — a mid-session rename
+		// (pi.setSessionName / the PWA's Rename button) reaches the hub within
+		// one heartbeat via the idempotent upsert.
+		if (nameFn) payload.name = nameFn();
 		try {
 			const res = await fetch(`${base}/register`, {
 				method: "POST",
@@ -74,20 +79,26 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		let sessionId = "";
 		let sessionFile = "";
-		let name = "";
 		try {
 			sessionId = ctx.sessionManager.getSessionId?.() ?? "";
 			sessionFile = ctx.sessionManager.getSessionFile?.() ?? "";
-			name = ctx.sessionManager.getSessionName?.() ?? "";
 		} catch {
 			// no session persistence (--no-session) — still register, just unnamed
 		}
+		const cwd = ctx.cwd ?? process.cwd();
+		nameFn = () => {
+			try {
+				return ctx.sessionManager.getSessionName?.() || basename(cwd);
+			} catch {
+				return basename(cwd);
+			}
+		};
 		payload = {
 			pid: process.pid,
 			sessionId,
 			sessionFile,
-			cwd: ctx.cwd ?? process.cwd(),
-			name: name || basename(ctx.cwd ?? process.cwd()),
+			cwd,
+			name: nameFn(),
 		};
 		await register();
 		if (!heartbeat) {

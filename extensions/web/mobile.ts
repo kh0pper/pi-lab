@@ -24,6 +24,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ExtensionAPI, ExtensionContext, SlashCommandInfo } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { annotate, readLocalModels, startModel } from "../../lib/local-models.mjs";
+import { readSessionMeta, setSessionArchived } from "../../lib/sessions.mjs";
 
 // ── Static files ─────────────────────────────────────────────
 
@@ -609,6 +610,38 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		return;
 	}
 
+	// Session rename (pi-lab fork) — pi-native: appends a session_info entry,
+	// so the name also shows in pi's own resume picker. Empty name = clear.
+	if (p === "/session/rename" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { name?: string };
+			if (typeof body.name !== "string") { json(res, 400, { error: "name (string) required" }); return; }
+			if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
+			const name = body.name.trim().slice(0, 120);
+			_pi.setSessionName(name);
+			json(res, 200, { ok: true, name: name || null });
+		} catch {
+			json(res, 400, { error: "Invalid JSON body" });
+		}
+		return;
+	}
+
+	// Session archive (pi-lab fork) — sidecar flag; hides this session from
+	// the Perch roost / /sessions lists once it is no longer live.
+	if (p === "/session/archive" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { archived?: boolean };
+			const id = _lastCtx?.sessionManager?.getSessionId?.() ?? "";
+			if (!id) { json(res, 503, { error: "no persistent session (--no-session?)" }); return; }
+			const archived = body.archived !== false;
+			setSessionArchived(id, archived);
+			json(res, 200, { ok: true, archived });
+		} catch {
+			json(res, 400, { error: "Invalid JSON body" });
+		}
+		return;
+	}
+
 	// Models API — available models + local server state + vision (pi-lab fork)
 	if (p === "/models" && req.method === "GET") {
 		let refs: string[] = [];
@@ -638,11 +671,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		let idle: boolean | null = null;
 		let contextPercent: number | null = null;
 		let modelVision = false;
+		let sessionId: string | null = null;
+		let sessionName: string | null = null;
+		let sessionArchived = false;
 		try {
 			model = _lastCtx?.model ? `${_lastCtx.model.provider}/${_lastCtx.model.id}` : null;
 			idle = _lastCtx?.isIdle() ?? null;
 			const input = (_lastCtx?.model as { input?: string[] } | undefined)?.input;
 			modelVision = Array.isArray(input) && input.includes("image");
+			sessionId = _lastCtx?.sessionManager?.getSessionId?.() ?? null;
+			sessionName = _lastCtx?.sessionManager?.getSessionName?.() ?? null;
+			if (sessionId) sessionArchived = readSessionMeta()[sessionId]?.archived === true;
 		} catch {
 			// context gone — report unknowns
 		}
@@ -658,6 +697,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 				planMode: _planState,
 				permMode: _permMode,
 				cwd: _cwd,
+				sessionId,
+				sessionName,
+				sessionArchived,
 			},
 			system: {
 				nodeVersion: process.version,

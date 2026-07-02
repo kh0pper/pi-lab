@@ -8,8 +8,10 @@
  *     GET  /login, POST /login   cookie login (token = pi-webserver apiToken)
  *     *    /s/<pid>/...          reverse proxy to that session's web server
  *                                (SSE-safe; Bearer header injected)
- *     GET  /api/hub/sessions     on-disk sessions (bot workspaces filtered)
+ *     GET  /api/hub/sessions     on-disk sessions (bot workspaces filtered;
+ *                                ?archived=1 includes archived)
  *     GET  /api/hub/live         registered live sessions
+ *     POST /api/hub/archive      {id, archived} → sidecar archive flag
  *     POST /api/hub/spawn        {cwd, prompt?, model?} → tmux pi session
  *     POST /api/hub/resume       {file} → tmux pi session (refused if a live
  *                                registered process already owns the file)
@@ -34,7 +36,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULT_EXCLUDE_CWD_PATTERNS, listSessions, listTmuxPiSessions, spawnSession, teleportCommand } from "../lib/sessions.mjs";
+import { DEFAULT_EXCLUDE_CWD_PATTERNS, listSessions, listTmuxPiSessions, setSessionArchived, spawnSession, teleportCommand } from "../lib/sessions.mjs";
 
 const PUBLIC_PORT = Number(process.env.PI_HUB_PORT ?? 4200);
 const REGISTRY_PORT = Number(process.env.PI_HUB_REGISTRY_PORT ?? 4201);
@@ -284,7 +286,7 @@ function fmtAge(ms) {
 	return `${Math.round(m / 1440)}d ago`;
 }
 
-async function homePage(host) {
+async function homePage(host, { showArchived = false } = {}) {
 	sweep();
 	const entries = [...live.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 	const statuses = await Promise.all(entries.map(sessionStatus));
@@ -306,13 +308,15 @@ async function homePage(host) {
 		})
 		.join("");
 
-	const disk = listSessions({ limit: 25, excludeCwdPatterns: excludePatterns() })
+	const disk = listSessions({ limit: 25, excludeCwdPatterns: excludePatterns(), includeArchived: showArchived })
+		.filter((s) => s.archived === showArchived)
 		.map(
 			(s) => `<div class="roost-row"><span class="roost-dot"></span>
-<div class="roost-main"><div class="roost-cwd">${esc(homeTilde(s.cwd))}</div>
-<div class="roost-when">${fmtAge(s.mtimeMs)} · ${esc(s.id.slice(0, 8))}</div></div>
+<div class="roost-main"><div class="roost-cwd">${esc(s.name || homeTilde(s.cwd))}</div>
+<div class="roost-when">${s.name ? `${esc(homeTilde(s.cwd))} · ` : ""}${fmtAge(s.mtimeMs)} · ${esc(s.id.slice(0, 8))}</div></div>
 <button class="resume" data-file="${esc(s.file)}">Resume</button>
-<button class="quiet copy" data-cmd="${esc(teleportCommand(s))}">Teleport</button></div>`,
+<button class="quiet copy" data-cmd="${esc(teleportCommand(s))}">Teleport</button>
+<button class="quiet arch" data-id="${esc(s.id)}" data-archived="${s.archived ? "1" : "0"}">${s.archived ? "Unarchive" : "Archive"}</button></div>`,
 		)
 		.join("");
 
@@ -331,8 +335,8 @@ ${perches || '<div class="roost"><div class="empty">Nothing on the wire — star
 <form class="spawn" id="spawn"><input name="cwd" placeholder="Working directory — e.g. /home/kh0pp/pi-lab" required>
 <textarea name="prompt" rows="2" placeholder="First prompt (optional)"></textarea>
 <button class="primary" style="justify-self:start">Spawn on ${esc(host)}</button></form>
-<h2>Roost — recent sessions</h2>
-<div class="roost">${disk || '<div class="empty">No sessions on disk yet.</div>'}</div>
+<h2>${showArchived ? 'Archived sessions — <a href="/" style="color:var(--teal)">back to recent</a>' : 'Roost — recent sessions · <a href="/?archived=1" style="color:var(--dim)">archived</a>'}</h2>
+<div class="roost">${disk || `<div class="empty">${showArchived ? "Nothing archived." : "No sessions on disk yet."}</div>`}</div>
 <script>
 const msg=(t,ok)=>{const el=document.getElementById("msg");el.textContent=t;el.className=ok?"ok":""};
 const api=(p,b)=>fetch("/api/hub"+p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json());
@@ -340,6 +344,7 @@ document.getElementById("spawn").onsubmit=async(e)=>{e.preventDefault();const f=
 const r=await api("/spawn",{cwd:f.get("cwd"),prompt:f.get("prompt")||undefined});msg(r.error||("Spawned: "+r.command),!r.error);setTimeout(()=>location.reload(),1200)};
 for(const b of document.querySelectorAll("button.resume"))b.onclick=async()=>{const r=await api("/resume",{file:b.dataset.file});msg(r.error||("Resumed: "+r.command),!r.error);setTimeout(()=>location.reload(),1200)};
 for(const b of document.querySelectorAll("button.copy"))b.onclick=()=>navigator.clipboard.writeText(b.dataset.cmd).then(()=>msg("Copied: "+b.dataset.cmd,true));
+for(const b of document.querySelectorAll("button.arch"))b.onclick=async()=>{const r=await api("/archive",{id:b.dataset.id,archived:b.dataset.archived!=="1"});msg(r.error||"Done",!r.error);setTimeout(()=>location.reload(),500)};
 </script></body></html>`;
 }
 
@@ -398,15 +403,22 @@ const publicServer = http.createServer(async (req, res) => {
 
 		if (pathname === "/" && req.method === "GET") {
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-			return res.end(await homePage(os.hostname()));
+			return res.end(await homePage(os.hostname(), { showArchived: url.searchParams.get("archived") === "1" }));
 		}
 
 		if (pathname === "/api/hub/sessions" && req.method === "GET") {
-			const sessions = listSessions({ excludeCwdPatterns: excludePatterns() }).map((s) => ({
+			const includeArchived = url.searchParams.get("archived") === "1";
+			const sessions = listSessions({ excludeCwdPatterns: excludePatterns(), includeArchived }).map((s) => ({
 				...s,
 				teleport: teleportCommand(s),
 			}));
 			return json(res, 200, { sessions });
+		}
+		if (pathname === "/api/hub/archive" && req.method === "POST") {
+			const body = await readBody(req);
+			if (!body.id) return json(res, 400, { error: "id required" });
+			setSessionArchived(String(body.id), body.archived !== false);
+			return json(res, 200, { ok: true, archived: body.archived !== false });
 		}
 		if (pathname === "/api/hub/live" && req.method === "GET") {
 			sweep();
@@ -425,7 +437,7 @@ const publicServer = http.createServer(async (req, res) => {
 					return json(res, 409, { error: `session already live (pid ${entry.pid}) — open its chat instead` });
 				}
 			}
-			const target = listSessions({ limit: 500, excludeCwdPatterns: excludePatterns() }).find((s) => s.file === body.file);
+			const target = listSessions({ limit: 500, excludeCwdPatterns: excludePatterns(), includeArchived: true }).find((s) => s.file === body.file);
 			if (!target) return json(res, 404, { error: "unknown session file" });
 			return json(res, 200, await spawnSession({ cwd: target.cwd, resumeFile: target.file }));
 		}
