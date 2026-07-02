@@ -163,6 +163,13 @@ function readBody(req, limit = 65536) {
 
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+// A perched songbird silhouette, feet on the wire (fill = currentColor).
+const BIRD_SVG = `<svg viewBox="0 0 32 22" fill="currentColor" aria-hidden="true">
+<path d="M2 9c3-4 7-5 10-4 1.2-2.4 3.4-3.6 5.8-3.2 1.7.3 3 1.4 3.7 2.9l4.2 1.5c.4.15.4.6.05.8l-3.6 1.6c.2 2.6-.9 5.2-3.2 6.8-1.8 1.2-3.9 1.6-5.9 1.2l-1.5 3h-1.7l1.2-3.6c-1.9-.8-3.4-2.3-4.1-4.3C5.4 11 3.6 10 2 9z"/>
+<circle cx="19.6" cy="5.6" r=".9" fill="var(--sky)"/>
+<path d="M12.5 18.5h1.4l-.3 3h-1zM16.5 18.7h1.4l-.3 2.8h-1z"/>
+</svg>`;
+
 // ── Reverse proxy /s/<pid>/... ────────────────────────────────
 
 function proxy(req, res, entry, subPath) {
@@ -209,10 +216,11 @@ header{padding:30px 0 20px;display:flex;align-items:baseline;justify-content:spa
 .machines a.here{background:var(--teal);border-color:var(--teal);color:#fff}
 a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);font-weight:600;margin:30px 0 12px}
-.perch{position:relative;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 16px 0;margin:22px 0 12px;box-shadow:0 1px 2px rgb(0 0 0/4%);overflow:hidden}
-.perch::before{content:"";position:absolute;left:0;right:0;top:0;border-top:2px solid var(--wire)}
-.bird{position:absolute;top:-5px;left:26px;width:12px;height:12px;border-radius:50% 50% 50% 4px;background:var(--alive);transform:rotate(-8deg);box-shadow:0 0 0 3px var(--sky)}
-.bird.attn{background:var(--attn)}.bird.idle{background:var(--wire)}
+.perch{position:relative;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 16px 0;margin:22px 0 12px;box-shadow:0 1px 2px rgb(0 0 0/4%)}
+.perch::before{content:"";position:absolute;left:-6px;right:-6px;top:0;border-top:2px solid var(--wire)}
+.bird{position:absolute;top:-17px;left:22px;width:26px;height:18px;color:var(--alive)}
+.bird svg{width:100%;height:100%;display:block}
+.bird.attn{color:var(--attn)}.bird.idle{color:var(--wire)}
 .perch-head{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .title{font-weight:600;font-size:17px}
 .meta{color:var(--dim);font-size:13px;margin-top:2px;word-break:break-all}
@@ -223,7 +231,7 @@ button{font:500 14px/1 Inter,system-ui,sans-serif;cursor:pointer;border-radius:1
 button.primary{background:var(--teal);border-color:var(--teal);color:#fff}
 button.quiet{color:var(--dim)}
 a.btn{display:inline-block;text-decoration:none;font:500 14px/1 Inter,system-ui,sans-serif;border-radius:10px;padding:10px 16px;background:var(--teal);color:#fff}
-.databar{margin:0 -16px;background:var(--teal-soft);border-top:1px solid var(--line);padding:7px 16px;font:12px "JetBrains Mono",ui-monospace,monospace;color:var(--teal);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.databar{margin:0 -16px;background:var(--teal-soft);border-top:1px solid var(--line);border-radius:0 0 13px 13px;padding:7px 16px;font:12px "JetBrains Mono",ui-monospace,monospace;color:var(--teal);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .databar .mono-dim{color:var(--dim)}
 .spawn{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;display:grid;gap:10px}
 input,textarea{font:14px Inter,system-ui,sans-serif;width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--sky);color:var(--ink)}
@@ -246,7 +254,7 @@ body{display:flex;align-items:center;justify-content:center;min-height:100vh}
 form{display:grid;gap:10px;width:300px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;position:relative}
 form::before{content:"";position:absolute;left:0;right:0;top:0;border-top:2px solid var(--wire);border-radius:14px 14px 0 0}
 form .bird{top:-5px}</style></head>
-<body><form method="POST" action="login"><span class="bird"></span><div class="brand">Perch<small>pi session hub</small></div>
+<body><form method="POST" action="login"><span class="bird">${BIRD_SVG}</span><div class="brand">Perch<small>pi session hub</small></div>
 <input type="password" name="token" placeholder="API token" autofocus><button class="primary">Sign in</button></form></body></html>`;
 
 /** Ask a live session's own web server for model/idle state. Fail-soft. */
@@ -288,7 +296,7 @@ async function homePage(host) {
 			const birdCls = idle === false ? "" : idle === true ? " idle" : "";
 			const stateCls = idle === false ? "" : "idle";
 			const stateTxt = idle === false ? "working" : idle === true ? "idle" : "live";
-			return `<div class="perch"><span class="bird${birdCls}"></span>
+			return `<div class="perch"><span class="bird${birdCls}">${BIRD_SVG}</span>
 <div class="perch-head"><div><div class="title">${esc(e.name || path.basename(e.cwd))}</div>
 <div class="meta">${esc(homeTilde(e.cwd))}</div></div>
 <div class="state ${stateCls}">${stateTxt}</div></div>
@@ -378,7 +386,14 @@ const publicServer = http.createServer(async (req, res) => {
 			sweep();
 			const entry = live.get(Number(proxyMatch[1]));
 			if (!entry) return json(res, 404, { error: "no such live session (it may have exited)" });
-			return proxy(req, res, entry, (proxyMatch[2] ?? "/") + (url.search ?? ""));
+			const sub = proxyMatch[2] ?? "/";
+			// The session server's own root is its internal mounts dashboard — a
+			// dead end behind the proxy. Land on the chat instead.
+			if (sub === "/" || sub === "") {
+				res.writeHead(302, { Location: `/s/${proxyMatch[1]}/mobile` });
+				return res.end();
+			}
+			return proxy(req, res, entry, sub + (url.search ?? ""));
 		}
 
 		if (pathname === "/" && req.method === "GET") {

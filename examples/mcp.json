@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "crow-memory":   { "command": "node", "args": ["servers/memory/index.js"],   "cwd": "/path/to/crow", "env": { "CROW_DB_PATH": "./data/crow.db" } },
-    "crow-projects": { "command": "node", "args": ["servers/research/index.js"], "cwd": "/path/to/crow", "env": { "CROW_DB_PATH": "./data/crow.db" } },
-    "crow-sharing":  { "command": "node", "args": ["servers/sharing/index.js"],  "cwd": "/path/to/crow", "env": { "CROW_DB_PATH": "./data/crow.db" } },
-    "crow-blog":     { "command": "node", "args": ["servers/blog/index.js"],     "cwd": "/path/to/crow", "env": { "CROW_DB_PATH": "./data/crow.db" } },
-    "crow-storage":  { "command": "node", "args": ["servers/storage/index.js"],  "cwd": "/path/to/crow", "env": { "CROW_DB_PATH": "./data/crow.db" } }
-  }
-}

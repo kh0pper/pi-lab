@@ -1,11 +1,20 @@
 /**
  * critic — independent fresh-context critics for the working diff (tenet port).
  *
- * /critique [base-ref] runs the configured critic agents (default:
- * code-critic + test-critic) in parallel, each in its own spawned pi process
- * with NO access to this session's conversation — they judge the artifact,
- * not the author's reasoning (tenet's core insight: same-author tests have
- * ~6% precision; generation and validation need separate contexts).
+ * /critique [base-ref] [frontier | provider/model-id]
+ *   Runs the configured critic agents (default code-critic + test-critic) in
+ *   parallel, each in its own spawned pi process with NO access to this
+ *   session's conversation — they judge the artifact, not the author's
+ *   reasoning (tenet's core insight: same-author tests have ~6% precision;
+ *   generation and validation need separate contexts).
+ *   Critics run on their bound models (LOCAL by default — cloud is for
+ *   planning). Add "frontier" to run this review on critic.frontierModel
+ *   (default zai-coding/glm-5.1), or pass any provider/id explicitly.
+ *
+ * /critique auto on|off
+ *   Toggle automatic critique when a plan finishes executing (plan-mode
+ *   emits "plan-mode:complete"). Default ON — the point of long local
+ *   agentic flows is that validation happens without you asking.
  *
  * Each critic must end its reply with a fenced JSON verdict:
  *   {"passed": bool, "findings": [{"category", "severity", "detail"}]}
@@ -20,7 +29,7 @@
  *   }
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
@@ -32,6 +41,21 @@ interface CriticConfig {
 	agents?: string[];
 	baseRef?: string;
 	maxDiffBytes?: number;
+	/** Auto-run when a plan finishes executing (default true). */
+	auto?: boolean;
+	/** Model used when invoked as "/critique frontier". */
+	frontierModel?: string;
+}
+
+function writeCriticConfig(patch: Partial<CriticConfig>): void {
+	const settingsPath = resolve(homedir(), ".pi", "agent", "settings.json");
+	try {
+		const raw = existsSync(settingsPath) ? (JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, any>) : {};
+		raw.critic = { ...(raw.critic ?? {}), ...patch };
+		writeFileSync(settingsPath, JSON.stringify(raw, null, 2));
+	} catch {
+		// best-effort
+	}
 }
 
 interface Verdict {
@@ -98,9 +122,18 @@ export function parseVerdict(output: string): Verdict {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerCommand("critique", {
-		description: "Run independent critics on the working diff: /critique [base-ref]",
-		handler: async (args, ctx: ExtensionCommandContext) => {
+	// Bridge web-dispatched invocations ("command:critique" bus events) — they
+	// bypass registerCommand, so capture a ctx and route them to the same logic.
+	let lastCtx: ExtensionCommandContext | null = null;
+	pi.on("session_start", async (_event, ctx) => {
+		lastCtx = ctx as unknown as ExtensionCommandContext;
+	});
+	pi.events.on("command:critique", (data) => {
+		if (!lastCtx) return;
+		void runCritique((((data as { args?: string })?.args) ?? "").trim(), lastCtx);
+	});
+
+	const runCritique = async (args: string, ctx: ExtensionCommandContext) => {
 			const cfg = loadConfig();
 			if (cfg.enabled === false) {
 				ctx.ui.notify("Critic is disabled (settings.json critic.enabled)", "warning");
@@ -108,7 +141,32 @@ export default function (pi: ExtensionAPI) {
 			}
 			const criticNames = cfg.agents ?? ["code-critic", "test-critic"];
 			const maxDiffBytes = cfg.maxDiffBytes ?? 100_000;
-			let ref = (args ?? "").trim() || cfg.baseRef || "HEAD";
+
+			// Parse args: "frontier" (or any token that resolves in the model
+			// registry as provider/id) overrides the critic model for THIS run;
+			// everything else is the base ref. Registry validation keeps git
+			// refs containing "/" (origin/main, feature/x) unambiguous.
+			let modelOverride: string | undefined;
+			const refTokens: string[] = [];
+			for (const tok of (args ?? "").trim().split(/\s+/).filter(Boolean)) {
+				if (tok === "frontier") {
+					modelOverride = cfg.frontierModel ?? "zai-coding/glm-5.1";
+					continue;
+				}
+				const slash = tok.indexOf("/");
+				if (slash > 0 && !modelOverride) {
+					try {
+						if (ctx.modelRegistry.find(tok.slice(0, slash), tok.slice(slash + 1))) {
+							modelOverride = tok;
+							continue;
+						}
+					} catch {
+						// not a model — treat as ref
+					}
+				}
+				refTokens.push(tok);
+			}
+			let ref = refTokens.join(" ") || cfg.baseRef || "HEAD";
 
 			// Collect the diff (uncommitted vs ref; fall back to last commit when clean).
 			let diff = (await pi.exec("git", ["diff", ref], { cwd: ctx.cwd })).stdout;
@@ -138,14 +196,22 @@ export default function (pi: ExtensionAPI) {
 				? `The diff is too large to inline (> ${maxDiffBytes} bytes). Changed files (${refNote}):\n${changedFiles}\n\nRun \`git diff ${ref} -- <file>\` yourself per file and review every change.`
 				: `Unified diff (${refNote}):\n\n\`\`\`diff\n${diff}\n\`\`\``;
 
-			const { agents } = discoverAgents(ctx.cwd, "user");
-			const missing = criticNames.filter((n) => !agents.some((a) => a.name === n));
+			const discovered = discoverAgents(ctx.cwd, "user").agents;
+			const missing = criticNames.filter((n) => !discovered.some((a) => a.name === n));
 			if (missing.length > 0) {
 				ctx.ui.notify(`Missing critic agents: ${missing.join(", ")} (run scripts/install-bridges.sh)`, "error");
 				return;
 			}
+			// Per-run model override: hand the runner cloned agent configs.
+			// forceModel beats settings modelOverrides inside the runner.
+			const agents = modelOverride
+				? discovered.map((a) => (criticNames.includes(a.name) ? { ...a, forceModel: modelOverride } : a))
+				: discovered;
 
-			ctx.ui.notify(`Running ${criticNames.length} critics on the diff (${refNote})…`, "info");
+			ctx.ui.notify(
+				`Running ${criticNames.length} critics on the diff (${refNote})${modelOverride ? ` on ${modelOverride}` : ""}…`,
+				"info",
+			);
 			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
 				mode: "parallel",
 				agentScope: "user",
@@ -202,6 +268,9 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			if (!allPassed && ctx.hasUI) {
+				// The confirm renders in the terminal — ping remote watchers so a
+				// phone user knows why the session went quiet.
+				pi.events.emit("pi-lab:attention", { reason: "critique", detail: "critics found blocking issues — confirm in terminal or reply here" });
 				const send = await ctx.ui.confirm(
 					"Critics found blocking issues",
 					"Send the findings to the agent to address?",
@@ -219,6 +288,30 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			}
+	};
+
+	// Auto-critique when a plan finishes executing (the long-local-flow case:
+	// generation just ended, validation should start without being asked).
+	pi.events.on("plan-mode:complete", () => {
+		if (!lastCtx) return;
+		if (loadConfig().auto === false) return;
+		void runCritique("", lastCtx);
+	});
+
+	pi.registerCommand("critique", {
+		description: "Independent critics on the diff: /critique [base-ref] [frontier|provider/id] · /critique auto on|off",
+		handler: async (args, ctx: ExtensionCommandContext) => {
+			const trimmed = (args ?? "").trim();
+			if (trimmed === "auto on" || trimmed === "auto off") {
+				writeCriticConfig({ auto: trimmed.endsWith("on") });
+				ctx.ui.notify(`Auto-critique after plan execution: ${trimmed.endsWith("on") ? "ON" : "OFF"}`);
+				return;
+			}
+			if (trimmed === "auto") {
+				ctx.ui.notify(`Auto-critique is ${loadConfig().auto === false ? "OFF" : "ON"} (toggle: /critique auto on|off)`);
+				return;
+			}
+			return runCritique(trimmed, ctx);
 		},
 	});
 }

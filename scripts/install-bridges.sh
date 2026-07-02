@@ -55,10 +55,33 @@ link_skill() {
   _linked=$((_linked+1))
 }
 
-# 1. Claude's per-user skills tree
+# Skills that only make sense inside Claude Code (its sessions, hooks,
+# plugins, CLAUDE.md tooling) — bridging them into pi is pure menu noise.
+is_claude_code_only() {
+  case "$1" in
+    claude-session-recovery|claude-md-improver|claude-automation-recommender|\
+    hook-development|writing-hookify-rules|plugin-settings|plugin-structure|\
+    command-development|skill-development|skill-creator|example-command|example-skill)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 1. Claude's per-user skills tree — per-skill links so Claude-Code-only
+#    skills can be filtered (was previously one whole-tree symlink).
+if [ -L "$PI_SKILLS/_claude" ]; then
+  rm -f "$PI_SKILLS/_claude"; echo "removed legacy whole-tree link: _claude"
+fi
 if [ -d "$HOME/.claude/skills" ]; then
-  ln -sfn "$HOME/.claude/skills" "$PI_SKILLS/_claude"
-  echo "linked: ~/.claude/skills → $PI_SKILLS/_claude"
+  _linked=0; _skipped=0; _collisions=0; _filtered=0
+  for skill_dir in "$HOME"/.claude/skills/*/; do
+    skill_md="${skill_dir%/}/SKILL.md"
+    [ -f "$skill_md" ] || continue
+    name="$(basename "${skill_dir%/}")"
+    if is_claude_code_only "$name"; then _filtered=$((_filtered+1)); rm -f "$PI_SKILLS/$name" 2>/dev/null; continue; fi
+    link_skill "$skill_md" "$name" dir
+  done
+  echo "linked: $_linked user skills ($_filtered Claude-Code-only filtered, $_collisions collisions)"
 fi
 
 # 2. Claude plugin skills — one wrapper dir per skill, named after frontmatter `name:`.
@@ -71,7 +94,12 @@ for plugin_skills_dir in "$HOME"/.claude/plugins/marketplaces/*/plugins/*/skills
   for skill_dir in "$plugin_skills_dir"/*/; do
     skill_md="${skill_dir%/}/SKILL.md"
     [ -f "$skill_md" ] || continue
-    link_skill "$skill_md" "$(basename "${skill_dir%/}")" dir
+    _pname="$(basename "${skill_dir%/}")"
+    _fmname=$(awk '/^---$/{c++; next} c==1 && /^name:/{sub(/^name:[[:space:]]*/,""); print; exit}' "$skill_md")
+    if is_claude_code_only "$_pname" || { [ -n "$_fmname" ] && is_claude_code_only "$_fmname"; }; then
+      rm -f "$PI_SKILLS/$_pname" "$PI_SKILLS/$_fmname" 2>/dev/null; continue
+    fi
+    link_skill "$skill_md" "$_pname" dir
   done
 done
 echo "linked: $_linked plugin skills (skipped $_skipped no-description, $_collisions collisions)"
@@ -141,5 +169,18 @@ for f in "$REPO_ROOT"/extensions/subagent/prompts/*.md; do
   ln -sfn "$f" "$target"; _linked=$((_linked+1))
 done
 echo "linked: $_linked pi-lab prompts ($_collisions collisions)"
+
+# 6. Keybindings: pi core binds shift+tab to thinking-level cycling; the
+#    permission-modes extension wants it for Claude-Code-parity mode cycling.
+#    Move thinking to ctrl+alt+t (only if the user hasn't remapped it already).
+python3 - <<'PYEOF'
+import json, os
+p = os.path.expanduser("~/.pi/agent/keybindings.json")
+d = json.load(open(p)) if os.path.exists(p) else {}
+if "app.thinking.cycle" not in d:
+    d["app.thinking.cycle"] = "ctrl+alt+t"
+    json.dump(d, open(p, "w"), indent=2)
+    print("keybindings: thinking cycle -> ctrl+alt+t (shift+tab freed for /mode)")
+PYEOF
 
 echo "done."

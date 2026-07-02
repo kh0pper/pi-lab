@@ -1,133 +1,75 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Pi also reads it natively (it loads AGENTS.md or CLAUDE.md at session start).
 
 ## What this repo is
 
-A "pi package" loaded by [pi-coding-agent](https://github.com/badlogic/pi-mono) at runtime. Provides MCP-client bridging, plan-mode, sub-agents, todos, plus a set of harness-improvement extensions (permission gating, structured compaction, system-prompt hints, bash error hints) and a verifier script.
+A "pi package" loaded by [pi-coding-agent](https://github.com/badlogic/pi-mono) at runtime (the installed fork is `@earendil-works/pi-coding-agent`; source imports use the old `@mariozechner/*` scope, resolved by pi's runtime alias map). It turns pi into a full Claude-Code-style harness: plan mode with plan/execute model pickers, subagents, independent critics, permission modes with a local classifier, ntfy push notifications, and a self-hosted remote-access stack (the **Perch** hub + mobile PWA).
 
-Pi discovers this package via `package.json` → `pi.extensions: ["./extensions"]`. It then imports every `.ts` file in `extensions/` (and `index.ts` of each subdir) using **jiti at runtime**. There is **no build step** — edit, save, restart pi, done.
+Pi discovers this package via `package.json` → `pi.extensions: ["./extensions"]`, importing every `.ts` file in `extensions/` and each subdir's `index.ts` **via jiti at runtime**. No build step — edit, save, restart pi.
+
+## Layout
+
+```
+extensions/
+  plan-mode/          /plan (+ model pickers), /deep-plan, plan persistence to .pi/plans/
+  subagent/           subagent tool (single/parallel/chain), agents/*.md, run.ts spawn runner,
+                      /agent-models re-binding; prompts/*.md become slash commands (incl. /init)
+  critic/             /critique — independent fresh-context critics; auto-runs after plan execution
+  permission-modes.ts /mode ask|accept-edits|auto|bypass; auto uses a local classifier model
+  permission-gating.ts catastrophic-op backstop (always active, all modes)
+  web/                vendored fork of @e9n/pi-webserver + pi-mobile (MIT, see THIRD_PARTY.md):
+                      shared loopback HTTP server + the Perch session PWA + send_user_file tool
+  session-web/        /sessions page + API (list/resume/spawn/teleport)
+  remote-register.ts  per-session glue: registers with the pi-hub daemon (opt-in via settings)
+  notify.ts           ntfy pushes (run finished / needs input / web-initiated replies)
+  mcp-client.ts, todo.ts, bash-error-hint.ts, tool-hint.ts,
+  structured-compaction.ts, session-state-loader.ts, local-models.ts (/serve)
+hub/                  Perch daemon (standalone Node, systemd user service) + install.sh
+lib/                  sessions.mjs, local-models.mjs — plain ESM shared by extensions AND the hub
+scripts/install-bridges.sh   symlinks agents/prompts/skills into ~/.pi/agent (re-runnable)
+bin/pi-extension-check       jiti load-check for a single extension
+```
 
 ## Common commands
 
 ```bash
-# Verify a single extension parses + loads + exports a function
+npm run test:extensions            # loader gate — run before every commit
 ./bin/pi-extension-check extensions/<name>.ts
-
-# Run the verifier across every extension (gate before commit/push)
-npm run test:extensions
-
-# Install / update on a machine that uses this package
-git clone https://github.com/kh0pper/pi-lab ~/pi-lab   # then add "../../pi-lab" to packages
-cd ~/pi-lab && git pull                            # subsequent updates
+bash scripts/install-bridges.sh    # after pulling or adding agents/prompts/skills
+bash hub/install.sh                # (re)install the pi-hub systemd user service
 ```
 
-There is no `npm test`, no linter, no type-checker configured. Type-checking happens implicitly via jiti's parse step (which is what `pi-extension-check` invokes) and via pi's own runtime when an extension's event handler fires.
-
-The `npm test:extensions` script intentionally skips `extensions/todo.ts` — it imports `@mariozechner/pi-ai`, whose `exports` field only declares `import` (no `require`), and jiti's standalone resolver falls through to a CJS path that doesn't match. Pi's own runtime resolver handles it fine. If a new extension fails the verifier with `No "exports" main defined in @mariozechner/pi-ai/package.json`, the file is fine — add it to the skip list.
+The gate SKIPs files that value-import pi internals or pi-ai (`todo.ts`, `subagent/index.ts`, `plan-mode/index.ts`, `web/index.ts`, `critic/index.ts`, `permission-modes.ts`) — the standalone jiti has no runtime alias map, so those are known false negatives, fine at pi runtime. Prefer **type-only imports** in new extensions so the gate stays meaningful. Runtime-verify event-driven code through a tmux session, never `-p` (see Don't break).
 
 ## Extension authoring contract
 
-Every file in `extensions/` (or the `index.ts` of a subdir) **must default-export a function** of shape:
+Every `extensions/*.ts` (or subdir `index.ts`) must default-export `(pi: ExtensionAPI) => void`. Anything else silently doesn't load.
 
-```ts
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-export default function (pi: ExtensionAPI) {
-  pi.on("event_name", (event, ctx) => { /* ... */ });
-  // or pi.registerTool(...), pi.registerCommand(...)
-}
-```
+- **`before_agent_start`**: to modify the system prompt, RETURN `{ systemPrompt: event.systemPrompt + … }` — the runner chains results across extensions. `event.systemPromptOptions` looks mutable but isn't.
+- **`tool_call`**: return `{ block, reason }` to gate; mutate `event.input` in place to modify args (plan-mode injects `toolsOverride` into subagent calls this way).
+- **`tool_result`**: return `{ content, details, isError }` to transform what the LLM sees.
+- **Web-dispatched slash commands arrive as BUS events (`command:<name>`), not via `registerCommand`** — pi's web prompt route emits them. Any command that should work from the phone needs a `pi.events.on("command:<name>", …)` bridge with a captured ctx (see plan-mode, critic, todo). Unknown command-shaped input from the web is rejected before it can reach the model (it used to freelance into MCP tools).
+- **Bot-exclusion invariant**: every extension with ambient side effects (servers, notifications, hub registration, subagent user-agent discovery, permission modes) must no-op when `PI_BOT_PERMISSION_POLICY` is set or `PIBOT_SUBAGENT_DEPTH >= 1`. Bots have their own policy system; breaking this exposes bot sessions or burns paid quota.
+- Per-extension config lives under its own key in `~/.pi/agent/settings.json`; read it fresh (live edits should apply without restart where cheap).
 
-Anything else (no default export, wrong type) silently doesn't load.
+## Key subsystems
 
-### `before_agent_start`: chain `systemPrompt`, don't mutate options
-
-Known footgun (caught us once already). The event has `event.systemPromptOptions: BuildSystemPromptOptions`, which **looks** mutable but is purely informational — pi has already built the system prompt by the time the event fires.
-
-To modify the system prompt, **return** `{ systemPrompt: event.systemPrompt + "..." }`. The runner chains across extensions: each one sees the previous extension's result as its own `event.systemPrompt`, and the final result is what the LLM sees.
-
-Both `tool-hint.ts` and `session-state-loader.ts` use this pattern. See `dist/core/extensions/runner.js` (`emitBeforeAgentStart`) in pi for the chain implementation.
-
-### `tool_call` for guarding, `tool_result` for transforming
-
-`tool_call` handlers return `{ block?: boolean, reason?: string }` to gate execution (used by `permission-gating.ts`). To modify args, mutate `event.input` in place — that one IS mutable.
-
-`tool_result` handlers return `{ content?, details?, isError? }` to transform the result the LLM sees (used by `bash-error-hint.ts`). Doesn't have to block; can just augment.
-
-### `session_compact` for post-compaction work
-
-Fires AFTER pi's default compaction completes. `event.compactionEntry.summary` is the markdown narrative. `structured-compaction.ts` parses its `## Decisions` / `## Open Items` / `## Next Steps` headers and writes a structured JSON state file — without making its own LLM call.
-
-### Per-extension config
-
-Each extension that has settings reads its own key out of `~/.pi/agent/settings.json`:
-
-```json
-{
-  "bashErrorHint": { "enabled": true },
-  "toolHint":      { "enabled": true },
-  "structuredCompaction": { "enabled": true, "stateFilePath": "~/.pi/agent/session-state.json" },
-  "sessionStateLoader":   { "enabled": true, "stateFilePath": "~/.pi/agent/session-state.json", "maxContextLength": 2000 }
-}
-```
-
-All settings are optional. Default is enabled.
-
-## Architecture
-
-### Two extension shapes
-
-- **Single `.ts` file**: small, single-purpose extensions. Examples: `bash-error-hint.ts`, `tool-hint.ts`, `permission-gating.ts`, `session-state-loader.ts`, `structured-compaction.ts`, `mcp-client.ts`, `todo.ts`.
-- **Subdirectory with `index.ts`** (and helper files): for compound extensions with multi-file logic. Examples: `plan-mode/` (utils.ts, README.md), `subagent/` (agents.ts, agents/, prompts/, README.md).
-
-Pi discovers `extensions/*.ts` and `extensions/*/index.ts` indistinguishably. Use a subdir when the helpers would clutter the main file.
-
-### `mcp-client.ts` — the MCP bridge
-
-Reads `~/.pi/agent/mcp.json` (and `.mcp.json` in cwd ancestors), connects to each server, registers each tool as `mcp__<server>__<tool>`. Two transport shapes in mcp.json:
-
-```json
-"name": { "command": "...", "args": [...], "env": {...}, "cwd": "..." }
-"name": { "url": "https://host/path/mcp", "headers": {...}, "transport": "streamable" | "sse" }
-```
-
-The first shape is stdio. The second is HTTP (Streamable HTTP per the 2025-03-26 MCP spec, or legacy SSE). Default for the URL form is `streamable`. The MCP SDK is bundled as a direct dep so we get a pinned version.
-
-### `structured-compaction` + `session-state-loader` pair
-
-They share `~/.pi/agent/session-state.json`:
-- **structured-compaction** writes after each compaction (parses pi's narrative summary into structured fields).
-- **session-state-loader** reads on `before_agent_start` and chains a "Previous Session Context" block onto the system prompt.
-
-This gives continuity across compactions and across sessions without an extra LLM round-trip.
-
-### `permission-gating.ts` design rule
-
-Designed to fire *rarely*. Every false-positive trains the user to reflexively approve, defeating the purpose. Patterns are intentionally narrow: catastrophic bash only (`rm -rf` on root/`$HOME`, `sudo rm`, `dd of=/dev/...`, `mkfs`, fork bomb, shutdown), and writes/edits only to actual-secret paths (`.env`, `.key`, `.pem`, `.ssh/`, `.aws/`, `/etc/`, `/usr/`, `/root/`, `/boot/`). Project files (`package.json`, `Dockerfile`, `*.sql`) are intentionally NOT gated — they're version-controlled.
-
-Per-session memory: when the user answers a prompt, the answer is remembered for that exact pattern/path until pi restarts. Each pattern only prompts once.
-
-### `install-bridges.sh`
-
-Symlinks external skill trees into `~/.pi/agent/skills/` so pi auto-discovers them: per-user Claude skills (`~/.claude/skills`), Claude plugin marketplaces, and Crow skills (`~/crow/skills` and per-bundle `~/crow/bundles/*/skills`). Re-runnable; uses `ln -sfn`. Skips skills without `description:` frontmatter (pi refuses those and they'd add startup noise). Run after a fresh install or when adding a new Claude plugin.
-
-### bin/pi-extension-check
-
-Locates the active `pi` binary, follows the symlink to find pi-coding-agent's install dir, then uses pi's bundled `@mariozechner/jiti` to import the target `.ts` file and assert the default export is a function. Falls back to scanning `~/.nvm/versions/node/v*/bin/pi` if `pi` isn't on PATH (which happens in non-login SSH shells). Sets `NODE_PATH` to pi's `node_modules` so peer deps (typebox, MCP SDK) resolve the same way they do at runtime.
+- **Model pickers / bindings**: `/plan` snapshots tools + model, pops a planning-model picker; Execute pops an execution-model picker (whole planning conversation carries over). Always use `provider/id` form — bare ids can be ambiguous across providers. `/agent-models` persists re-binds to `settings.subagent.modelOverrides`, applied per spawn by `subagent/run.ts` (`forceModel` > settings override > frontmatter).
+- **Critics** (tenet port): fresh pi process per critic, sees the diff + optional `.pi/plans/` spec, never the conversation. Fail-closed fenced-JSON verdicts. Local models by default; `/critique frontier` for GLM. Auto-runs on the `plan-mode:complete` bus event (`critic.auto`).
+- **Permission modes**: `auto` classifies commands/tools via `permissionModes.classifierUrl` (a small always-on local model — e.g. a 4B via vLLM with `enable_thinking:false`, ~0.2s verdicts) with fallback to the session's current model, then fail-closed prompting. `permission-gating.ts` stays active in every mode as the catastrophic backstop.
+- **Local model orchestration**: `settings.localModels` maps `provider/id` → compose dir + health URL + evicts list. Policy: one local model at a time (each evicts all others). Readiness gates on llama.cpp `/health` — `/v1/models` answers 200 while weights are still loading. MTP-flagged composes need image `kyuz0/amd-strix-halo-toolboxes:vulkan-radv-mtp`.
+- **Perch hub** (`hub/server.mjs`): public listener :4200 (Bearer = `pi-webserver.apiToken`, cookie login) behind your HTTPS reverse proxy; registry listener :4201 loopback-only and NEVER in the Serve config (Serve traffic arrives from 127.0.0.1 — not exposing the port is the only protection). Proxies `/s/<pid>/…` to per-session servers with Bearer injected.
 
 ## Deployment
 
-This is **not** an npm package. Distribution is via git.
-
-- **First-time install on a machine**: `pi install git:<your-remote>` (pi clones to `~/.pi/agent/git/.../pi-lab/` and adds it to `~/.pi/agent/settings.json`'s `packages` array). Or, for a working clone you want to edit, `git clone` to `~/pi-lab` and add `"../../pi-lab"` to `packages` (settings.json lives at `~/.pi/agent/settings.json`, so `../../` = `~`).
-- **Update on a machine**: `cd ~/pi-lab && git pull` (or wherever the clone lives).
-- **Restart pi** after pulling — extensions load at session start.
-
-Deployed machines pull from the same git remote. There's no CI; the `npm run test:extensions` gate is what catches load-time errors before they ship.
+Clone to `~/pi-lab`, add `"../../pi-lab"` to the `packages` array in `~/.pi/agent/settings.json`, run `bash scripts/install-bridges.sh`, restart pi. Update = `git pull` + rerun the bridge script + restart pi sessions (and the pi-hub service if hub/web changed). **Never load this alongside the original `npm:@e9n/*` packages** — they dual-load against the vendored `extensions/web/` and race for port 4100.
 
 ## Don't break
 
-- **Don't comment-block-end with `*/`** inside JSDoc text describing shell commands like `dd if=...of=...` — TypeScript thinks the comment ended. Past actual bug in `permission-gating.ts`.
-- **Don't reach for the unsafe shell-spawning APIs** inside extensions — there's a hook that warns about this. Use `execFile` (or its no-throw wrapper) if you must shell out.
-- **Don't forget the chain pattern for `before_agent_start`** — see "Extension authoring contract" above. Verifier won't catch this; only a smoke test will.
-- **Don't expect lifecycle events in print mode** — in `pi -p` / `--mode json -p` (pi v0.74.2), extensions LOAD (tools/commands register) but NO lifecycle events fire: no `session_start`, `agent_start`, `agent_end`, `turn_start`, and `pi.events` bus emits from event handlers never run. Verified empirically 2026-07-01 (`dist/modes/print-mode.js` never wires the extension runner into the loop; interactive mode does). Anything event-driven (notify, session registration) only works in interactive/tmux sessions — test event-driven extensions through `tmux send-keys`, not `-p`.
+- **Don't end a JSDoc line with `*/` inside shell-command examples** (e.g. `dd of=/dev/...`) — TypeScript ends the comment. Past real bug.
+- **No shell-string spawning** — use `execFile`/argv arrays (hook enforces this). When spawning `pi` for tmux sessions, resolve binaries absolutely and wrap with `env PATH=…` — systemd's bare PATH kills the pi shim's `#!/usr/bin/env node` (past real bug in hub spawns).
+- **`before_agent_start` chain pattern** — see contract above; only a smoke test catches violations.
+- **No lifecycle events in print mode** (`pi -p`, v0.74.2): extensions load, tools register, but `session_start`/`agent_start`/`agent_end`/bus-from-handlers never fire. Test event-driven behavior via `tmux send-keys`. Verified empirically 2026-07-01.
+- **Files served on the authenticated web origin**: only inert raster images render inline; everything else must be attachment + nosniff (XSS). File-access ids come from `crypto.randomBytes`.
+- **The exec-time tool restore** must use the `getActiveTools()` snapshot, never a hardcoded list — hardcoding once dropped subagent/todo/MCP tools for the rest of the session.

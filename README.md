@@ -9,7 +9,9 @@ Extensions for [pi-coding-agent](https://github.com/badlogic/pi-mono) that add C
 - **plan-mode** — `/plan` toggles a read-only exploration mode. On entry it pops a **planning-model picker** (run a frontier cloud model while you plan); choosing **Execute** pops an **execution-model picker** (drop to a cheap/local model with the whole planning conversation still in context). Accepted plans persist to `<repo>/.pi/plans/`. `/deep-plan <goal>` drives a scout→planner subagent chain.
 - **subagent** — `subagent` tool spawning isolated child `pi` processes: single, parallel, and chain modes; per-agent `model:` frontmatter; `/agent-models` re-binds any agent's model interactively (persisted to settings `subagent.modelOverrides`).
 - **critic** — `/critique [base-ref]` runs independent fresh-context critics (code-critic + test-critic) over your diff in parallel. Critics never see the authoring conversation — they judge the artifact, with an oracle-problem checklist for tests. Fenced-JSON verdicts, fail-closed, all-blocking.
-- **todo** — LLM-managed todo tool + `/todos` command.
+- **permission-modes** — Claude-Code-style `/mode ask|accept-edits|auto|bypass` (Shift+Tab cycles). `auto` judges commands/tools with a small local classifier model — only risky ones prompt. A separate catastrophic-op guard stays on in every mode.
+- **local-models** — `/serve`: start/stop local llama.cpp servers and switch to them; configured servers swap each other out to fit in RAM. The phone UI's model sheet does the same with live server state.
+- **todo** — LLM-managed todo tool + `/todos` command. `/init` generates the repo's AGENTS.md.
 
 **Remote access (self-hosted)**
 

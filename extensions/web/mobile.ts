@@ -1,31 +1,29 @@
 /**
  * pi-mobile — PWA mobile app for Pi agents.
  *
- * Mounts on pi-webserver:
- *   Page: /mobile              — PWA app shell (Preact + HTM)
+ * Mounts on pi-webserver (pi-lab fork — Perch session UI):
+ *   Page: /mobile               — PWA app shell (Chat / Session / Files / Activity)
  *   Page: /mobile/manifest.json — PWA manifest
- *   Page: /mobile/sw.js        — Service worker
- *   Page: /mobile/screens/*.js  — Screen modules
- *   API:  /api/mobile/health   — Health check
- *   API:  /api/mobile/chat/*   — Chat proxy (prompt submission)
- *   API:  /api/mobile/chat/commands — List available slash commands
- *   API:  /api/mobile/chat/prompt   — Submit prompt (auto-routes /commands)
- *   API:  /api/mobile/status   — Agent status
- *   API:  /api/mobile/td/*     — Task management proxy
- *   API:  /api/mobile/files/*  — File browser
- *   API:  /api/mobile/logs/*   — Log streaming
- *   API:  /api/mobile/cron/*   — Cron job management
- *   API:  /api/mobile/skills   — Skills browser
- *   API:  /api/mobile/extensions — Extensions list
- *   API:  /api/mobile/crm/*    — CRM proxy
- *   API:  /api/mobile/calendar/* — Calendar proxy
- *   API:  /api/mobile/settings — Settings
+ *   Page: /mobile/sw.js         — Service worker
+ *   API:  /api/mobile/health    — Health check
+ *   API:  /api/mobile/chat/*    — prompt submission (auto-routes /commands), SSE events
+ *   API:  /api/mobile/status    — agent status incl. model / idle / plan-mode state
+ *   API:  /api/mobile/models    — available models (plan-mode chip picker)
+ *   API:  /api/mobile/files/*   — workspace file browser
+ *   API:  /api/mobile/logs/*    — tool-activity SSE
+ *   API:  /api/mobile/skills, /extensions — read-only lists
+ *
+ * Upstream's td/crm/calendar/cron proxies were removed: they shelled out to
+ * CLIs from the original author's personal toolkit that don't exist here.
  */
 
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ExtensionAPI, ExtensionContext, SlashCommandInfo } from "@mariozechner/pi-coding-agent";
+import { Type } from "typebox";
+import { annotate, readLocalModels, startModel } from "../../lib/local-models.mjs";
 
 // ── Static files ─────────────────────────────────────────────
 
@@ -65,8 +63,8 @@ function json(res: ServerResponse, status: number, data: unknown): void {
 	send(res, status, "application/json; charset=utf-8", JSON.stringify(data));
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-	const MAX_SIZE = 1024 * 1024; // 1 MB
+function readBody(req: IncomingMessage, maxSize?: number): Promise<string> {
+	const MAX_SIZE = maxSize ?? 1024 * 1024; // 1 MB default
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
 		let totalSize = 0;
@@ -196,6 +194,25 @@ function routeCommand(text: string, commands: SlashCommandInfo[]): {
 let _pi: ExtensionAPI | null = null;
 /** Last-seen extension context — used to report model/idle state (pi-lab fork). */
 let _lastCtx: ExtensionContext | null = null;
+/** Mirrored plan-mode state (bus: "plan-mode:state"). */
+let _planState: { enabled: boolean; executing: boolean; todosDone: number; todosTotal: number } | null = null;
+/** provider/id of a local model server currently being started, if any. */
+let _modelStarting: string | null = null;
+/** Mirrored permission mode (bus: "perm-mode:state"). */
+let _permMode: string | null = null;
+
+/** Files the agent sent to the user via the send_user_file tool: id → meta. */
+const _sentFiles = new Map<string, { path: string; name: string; mime: string; size: number }>();
+
+const MIME_BY_EXT: Record<string, string> = {
+	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+	".webp": "image/webp", ".svg": "image/svg+xml", ".pdf": "application/pdf",
+	".txt": "text/plain", ".md": "text/markdown", ".html": "text/html", ".json": "application/json",
+	".csv": "text/csv", ".log": "text/plain", ".zip": "application/zip", ".mp4": "video/mp4",
+};
+function guessMime(p: string): string {
+	return MIME_BY_EXT[path.extname(p).toLowerCase()] ?? "application/octet-stream";
+}
 
 /** Active SSE client connections. */
 const sseClients = new Set<ServerResponse>();
@@ -229,10 +246,10 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 		return;
 	}
 
-	// POST /prompt — submit a prompt (handles slash commands)
+	// POST /prompt — submit a prompt (handles slash commands; images allowed → 40MB cap)
 	if (subPath === "/prompt" && req.method === "POST") {
 		try {
-			const body = JSON.parse(await readBody(req));
+			const body = JSON.parse(await readBody(req, 40 * 1024 * 1024));
 			if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
 			const prompt = body.prompt;
 			if (!prompt || typeof prompt !== "string") {
@@ -240,10 +257,24 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 				return;
 			}
 
+			// Web-initiated turn: notify.ts pushes when the reply is ready,
+			// regardless of run duration (Claude-remote behavior).
+			_pi.events.emit("pi-lab:web-prompt", {});
+
 			// Route slash commands through event bus or expansion
 			if (prompt.trim().startsWith("/")) {
 				const commands = _pi.getCommands();
 				const route = routeCommand(prompt.trim(), commands);
+
+				// Unknown command-shaped input must NOT fall through to the model
+				// as plain text — it will freelance (e.g. "/todos" once triggered a
+				// crow-tasks MCP dump of the whole lab task DB). Paths like
+				// "/etc/hosts" (name contains "/") still pass through as prose.
+				const parsedName = parseCommand(prompt.trim())?.name ?? "";
+				if (route.action === "unknown" && parsedName && !parsedName.includes("/")) {
+					json(res, 404, { error: `Unknown command: /${parsedName} — type / to see available commands` });
+					return;
+				}
 
 				if (route.action === "event-bus") {
 					// Extension command — emit on event bus
@@ -264,18 +295,63 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 				}
 			}
 
-			// Regular prompt — no matching slash command, send as-is
-			_pi.sendMessage(
-				{
-					customType: "mobile-prompt",
-					content: `📱 **Mobile:** ${prompt}`,
-					display: true,
-				},
-				{ triggerTurn: true },
-			);
+			// Regular prompt — no matching slash command. Images (pi-lab fork)
+			// ride the message as native ImageContent so vision models see
+			// them directly, exactly like pasting into the terminal.
+			const images = Array.isArray(body.images) ? (body.images as Array<{ dataBase64?: string; mimeType?: string }>) : [];
+			const imageBlocks = images
+				.filter((i) => i?.dataBase64 && i?.mimeType?.startsWith("image/"))
+				.slice(0, 8)
+				.map((i) => ({ type: "image" as const, data: i.dataBase64 as string, mimeType: i.mimeType as string }));
+			if (imageBlocks.length > 0) {
+				_pi.sendUserMessage([{ type: "text", text: prompt }, ...imageBlocks]);
+			} else {
+				_pi.sendMessage(
+					{
+						customType: "mobile-prompt",
+						content: `📱 **Mobile:** ${prompt}`,
+						display: true,
+					},
+					{ triggerTurn: true },
+				);
+			}
 			json(res, 200, { ok: true, message: "Prompt submitted" });
 		} catch {
 			json(res, 400, { error: "Invalid JSON body" });
+		}
+		return;
+	}
+
+	// GET /history — recent conversation for page load / SSE reconnect
+	// (pi-lab fork: without this, replies that arrive while the phone tab is
+	// backgrounded are simply never seen).
+	if (subPath === "/history" && req.method === "GET") {
+		try {
+			const entries = (_lastCtx?.sessionManager.getEntries?.() ?? []) as Array<{
+				type: string;
+				message?: { role?: string; content?: unknown };
+			}>;
+			const out: Array<{ kind: string; text: string }> = [];
+			for (const e of entries) {
+				if (e.type !== "message" || !e.message) continue;
+				const { role, content } = e.message;
+				let text = "";
+				if (typeof content === "string") text = content;
+				else if (Array.isArray(content)) {
+					text = (content as Array<{ type?: string; text?: string }>)
+						.filter((b) => b?.type === "text" && typeof b.text === "string")
+						.map((b) => b.text)
+						.join("\n");
+					const imgs = (content as Array<{ type?: string }>).filter((b) => b?.type === "image").length;
+					if (imgs) text = `${text}  📷×${imgs}`.trim();
+				}
+				if (!text.trim()) continue;
+				if (role === "user") out.push({ kind: "user", text: text.trim() });
+				else if (role === "assistant") out.push({ kind: "agent", text: text.trim() });
+			}
+			json(res, 200, { messages: out.slice(-60) });
+		} catch (err) {
+			json(res, 200, { messages: [], error: String((err as Error).message ?? err) });
 		}
 		return;
 	}
@@ -303,217 +379,6 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 			clearInterval(keepalive);
 			sseClients.delete(res);
 		});
-		return;
-	}
-
-	json(res, 404, { error: "Not found" });
-}
-
-// ── API: Tasks (td) ──────────────────────────────────────────
-
-async function runTd(args: string[]): Promise<{ ok: boolean; data?: string; error?: string }> {
-	if (!_pi) return { ok: false, error: "Agent not ready" };
-	try {
-		const result = await _pi.exec("td", args, { timeout: 15_000 });
-		const stdout = result.stdout?.trim() ?? "";
-		const stderr = result.stderr?.trim() ?? "";
-		if (result.code !== 0) return { ok: false, error: stderr || stdout || `Exit code ${result.code}` };
-		return { ok: true, data: stdout };
-	} catch (err: unknown) {
-		return { ok: false, error: err instanceof Error ? err.message : String(err) };
-	}
-}
-
-async function handleTdApi(req: IncomingMessage, res: ServerResponse, subPath: string): Promise<void> {
-	// GET /issues — list issues as JSON
-	if (subPath === "/issues" && req.method === "GET") {
-		const result = await runTd(["list", "--json"]);
-		if (!result.ok) { json(res, 500, { error: result.error }); return; }
-		try {
-			json(res, 200, { issues: JSON.parse(result.data!) });
-		} catch {
-			json(res, 200, { issues: [], raw: result.data });
-		}
-		return;
-	}
-
-	// GET /issues/:id — show single issue
-	if (subPath.match(/^\/issues\/[a-z0-9-]+$/) && req.method === "GET") {
-		const id = subPath.split("/")[2];
-		const result = await runTd(["show", id, "--json"]);
-		if (!result.ok) { json(res, 404, { error: result.error }); return; }
-		try {
-			json(res, 200, JSON.parse(result.data!));
-		} catch {
-			json(res, 200, { raw: result.data });
-		}
-		return;
-	}
-
-	// POST /issues — create issue
-	if (subPath === "/issues" && req.method === "POST") {
-		try {
-			const body = JSON.parse(await readBody(req));
-			const args = ["create", body.title || "Untitled"];
-			if (body.type) args.push("--type", body.type);
-			if (body.priority) args.push("--priority", body.priority);
-			if (body.labels) {
-				const labels = Array.isArray(body.labels) ? body.labels.join(",") : body.labels;
-				args.push("--label", labels);
-			}
-			if (body.minor) args.push("--minor");
-			const result = await runTd(args);
-			if (!result.ok) { json(res, 500, { error: result.error }); return; }
-			json(res, 201, { ok: true, output: result.data });
-		} catch {
-			json(res, 400, { error: "Invalid JSON body" });
-		}
-		return;
-	}
-
-	// PATCH /issues/:id — update issue (status transitions)
-	if (subPath.match(/^\/issues\/[a-z0-9-]+$/) && req.method === "PATCH") {
-		const id = subPath.split("/")[2];
-		try {
-			const body = JSON.parse(await readBody(req));
-			let result;
-			if (body.action === "start") result = await runTd(["start", id]);
-			else if (body.action === "close") result = await runTd(["close", id]);
-			else if (body.action === "reopen") result = await runTd(["reopen", id]);
-			else if (body.priority) result = await runTd(["edit", id, "--priority", body.priority]);
-			else { json(res, 400, { error: "Unknown action" }); return; }
-			if (!result.ok) { json(res, 500, { error: result.error }); return; }
-			json(res, 200, { ok: true, output: result.data });
-		} catch {
-			json(res, 400, { error: "Invalid JSON body" });
-		}
-		return;
-	}
-
-	json(res, 404, { error: "Not found" });
-}
-
-// ── API: CRM ─────────────────────────────────────────────────
-
-async function handleCrmApi(req: IncomingMessage, res: ServerResponse, subPath: string): Promise<void> {
-	if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
-
-	// GET /contacts — list contacts
-	if ((subPath === "/contacts" || subPath === "") && req.method === "GET") {
-		try {
-			const result = await _pi.exec("pi-crm", ["contacts", "list", "--json"], { timeout: 10_000 });
-			if (result.code === 0 && result.stdout) {
-				json(res, 200, JSON.parse(result.stdout));
-			} else {
-				json(res, 200, { contacts: [] });
-			}
-		} catch {
-			json(res, 200, { contacts: [] });
-		}
-		return;
-	}
-
-	// POST /contacts — create contact
-	if (subPath === "/contacts" && req.method === "POST") {
-		try {
-			const body = JSON.parse(await readBody(req));
-			const args = ["contacts", "create", body.name || "Unknown"];
-			if (body.email) args.push("--email", body.email);
-			if (body.company) args.push("--company", body.company);
-			const result = await _pi.exec("pi-crm", args, { timeout: 10_000 });
-			json(res, 201, { ok: result.code === 0, output: result.stdout?.trim() });
-		} catch {
-			json(res, 400, { error: "Invalid request" });
-		}
-		return;
-	}
-
-	json(res, 404, { error: "Not found" });
-}
-
-// ── API: Calendar ────────────────────────────────────────────
-
-async function handleCalendarApi(req: IncomingMessage, res: ServerResponse, subPath: string): Promise<void> {
-	if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
-
-	// GET /events — list upcoming events
-	if ((subPath === "/events" || subPath === "") && req.method === "GET") {
-		try {
-			const result = await _pi.exec("pi-calendar", ["events", "list", "--json"], { timeout: 10_000 });
-			if (result.code === 0 && result.stdout) {
-				json(res, 200, JSON.parse(result.stdout));
-			} else {
-				json(res, 200, { events: [] });
-			}
-		} catch {
-			json(res, 200, { events: [] });
-		}
-		return;
-	}
-
-	// POST /events — create event
-	if (subPath === "/events" && req.method === "POST") {
-		try {
-			const body = JSON.parse(await readBody(req));
-			const args = ["events", "create", body.title || "Untitled"];
-			if (body.date) args.push("--date", body.date);
-			if (body.time) args.push("--time", body.time);
-			const result = await _pi.exec("pi-calendar", args, { timeout: 10_000 });
-			json(res, 201, { ok: result.code === 0, output: result.stdout?.trim() });
-		} catch {
-			json(res, 400, { error: "Invalid request" });
-		}
-		return;
-	}
-
-	json(res, 404, { error: "Not found" });
-}
-
-// ── API: Cron ────────────────────────────────────────────────
-
-async function handleCronApi(req: IncomingMessage, res: ServerResponse, subPath: string): Promise<void> {
-	// GET /jobs — list all cron jobs
-	if ((subPath === "/jobs" || subPath === "") && req.method === "GET") {
-		if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
-		try {
-			const result = await _pi.exec("pi-cron", ["list", "--json"], { timeout: 10_000 });
-			if (result.code === 0 && result.stdout) {
-				json(res, 200, JSON.parse(result.stdout));
-			} else {
-				// pi-cron may not be installed — return empty list
-				json(res, 200, { jobs: [] });
-			}
-		} catch {
-			json(res, 200, { jobs: [] });
-		}
-		return;
-	}
-
-	// POST /jobs/:name/toggle — enable/disable
-	if (subPath.match(/^\/jobs\/[^/]+\/toggle$/) && req.method === "POST") {
-		const name = decodeURIComponent(subPath.split("/")[2]);
-		try {
-			const body = JSON.parse(await readBody(req));
-			if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
-			const action = body.enabled ? "enable" : "disable";
-			const result = await _pi.exec("pi-cron", [action, name], { timeout: 10_000 });
-			json(res, 200, { ok: result.code === 0, output: result.stdout?.trim() });
-		} catch {
-			json(res, 400, { error: "Invalid request" });
-		}
-		return;
-	}
-
-	// POST /jobs/:name/run — trigger manual run
-	if (subPath.match(/^\/jobs\/[^/]+\/run$/) && req.method === "POST") {
-		if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
-		const name = decodeURIComponent(subPath.split("/")[2]);
-		try {
-			const result = await _pi.exec("pi-cron", ["run", name], { timeout: 30_000 });
-			json(res, 200, { ok: result.code === 0, output: result.stdout?.trim() });
-		} catch {
-			json(res, 500, { error: "Run failed" });
-		}
 		return;
 	}
 
@@ -650,6 +515,120 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		return;
 	}
 
+	// Upload API (pi-lab fork) — send the session a file (screenshot, log, …)
+	// like Claude Code remote. Body: {name, dataBase64}. Saved under
+	// <cwd>/.pi/uploads/ so the agent can read it (vision models can view
+	// images via the read tool).
+	if (p === "/upload" && req.method === "POST") {
+		try {
+			const MAX = 20 * 1024 * 1024; // 20 MB decoded
+			const raw = await new Promise<string>((resolve, reject) => {
+				const chunks: Buffer[] = [];
+				let total = 0;
+				req.on("data", (c: Buffer) => {
+					total += c.length;
+					if (total > MAX * 1.4) { req.destroy(); reject(new Error("too large")); return; }
+					chunks.push(c);
+				});
+				req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+				req.on("error", reject);
+			});
+			const body = JSON.parse(raw) as { name?: string; dataBase64?: string };
+			if (!body.name || !body.dataBase64) { json(res, 400, { error: "name and dataBase64 required" }); return; }
+			const data = Buffer.from(body.dataBase64, "base64");
+			if (data.length > MAX) { json(res, 400, { error: "file too large (max 20MB)" }); return; }
+			const safeName = body.name.replace(/[^\w.-]+/g, "_").slice(-80) || "upload";
+			const uploadsDir = path.join(_cwd, ".pi", "uploads");
+			fs.mkdirSync(uploadsDir, { recursive: true });
+			const fileName = `${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}-${safeName}`;
+			fs.writeFileSync(path.join(uploadsDir, fileName), data);
+			json(res, 201, { path: path.join(".pi", "uploads", fileName), bytes: data.length });
+		} catch (err) {
+			json(res, 400, { error: String((err as Error).message ?? err) });
+		}
+		return;
+	}
+
+	// Model switch API (pi-lab fork) — set the session's active model. For
+	// managed local models whose server is down, this STARTS the server
+	// (docker compose, stopping same-group peers), then switches — progress
+	// streams over SSE as model_starting/model_switched/model_error events.
+	if (p === "/model" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { model?: string };
+			const ref = (body.model ?? "").trim();
+			const slash = ref.indexOf("/");
+			if (slash <= 0) { json(res, 400, { error: "model must be provider/id" }); return; }
+			if (!_pi || !_lastCtx) { json(res, 503, { error: "Agent not ready" }); return; }
+			const model = _lastCtx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
+			if (!model) { json(res, 404, { error: `unknown model: ${ref}` }); return; }
+
+			const doSwitch = async (): Promise<boolean> => {
+				const ok = await _pi!.setModel(model);
+				if (ok) broadcast({ type: "model_switched", model: ref, time: new Date().toISOString() });
+				return ok;
+			};
+
+			const managed = readLocalModels()[ref];
+			if (managed) {
+				let up = false;
+				try {
+					const probe = await fetch(`${managed.url.replace(/\/+$/, "")}/models`, { signal: AbortSignal.timeout(1500) });
+					up = probe.ok;
+				} catch {
+					up = false;
+				}
+				if (!up) {
+					if (_modelStarting) { json(res, 409, { error: `already starting ${_modelStarting}` }); return; }
+					_modelStarting = ref;
+					json(res, 202, { starting: true, model: ref });
+					void (async () => {
+						try {
+							await startModel(ref, {
+								onProgress: (stage) =>
+									broadcast({ type: "model_starting", model: ref, stage, time: new Date().toISOString() }),
+							});
+							if (!(await doSwitch())) {
+								broadcast({ type: "model_error", model: ref, error: "server up but setModel failed", time: new Date().toISOString() });
+							}
+						} catch (err) {
+							broadcast({ type: "model_error", model: ref, error: String((err as Error).message ?? err), time: new Date().toISOString() });
+						} finally {
+							_modelStarting = null;
+						}
+					})();
+					return;
+				}
+			}
+
+			if (!(await doSwitch())) { json(res, 502, { error: `could not switch to ${ref} (server down / no key?)` }); return; }
+			json(res, 200, { ok: true, current: ref });
+		} catch {
+			json(res, 400, { error: "Invalid JSON body" });
+		}
+		return;
+	}
+
+	// Models API — available models + local server state + vision (pi-lab fork)
+	if (p === "/models" && req.method === "GET") {
+		let refs: string[] = [];
+		let current: string | null = null;
+		const vision = new Map<string, boolean>();
+		try {
+			const available = _lastCtx ? _lastCtx.modelRegistry.getAvailable() : [];
+			refs = available.map((m) => `${m.provider}/${m.id}`);
+			for (const m of available) {
+				vision.set(`${m.provider}/${m.id}`, Array.isArray((m as { input?: string[] }).input) && (m as { input?: string[] }).input!.includes("image"));
+			}
+			current = _lastCtx?.model ? `${_lastCtx.model.provider}/${_lastCtx.model.id}` : null;
+		} catch {
+			// registry unavailable — empty list
+		}
+		const detailed = (await annotate(refs)).map((d) => ({ ...d, vision: vision.get(d.ref) ?? false }));
+		json(res, 200, { models: refs, detailed, current, starting: _modelStarting });
+		return;
+	}
+
 	// Status API — aggregated agent health
 	if (p === "/status") {
 		const tools = _pi ? _pi.getAllTools() : [];
@@ -657,14 +636,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		const mem = process.memoryUsage();
 		let model: string | null = null;
 		let idle: boolean | null = null;
+		let contextPercent: number | null = null;
+		let modelVision = false;
 		try {
 			model = _lastCtx?.model ? `${_lastCtx.model.provider}/${_lastCtx.model.id}` : null;
 			idle = _lastCtx?.isIdle() ?? null;
+			const input = (_lastCtx?.model as { input?: string[] } | undefined)?.input;
+			modelVision = Array.isArray(input) && input.includes("image");
 		} catch {
 			// context gone — report unknowns
 		}
 		json(res, 200, {
-			agent: { name: "Pi Agent", status: _pi ? "healthy" : "down", version: "0.1.0", model, idle },
+			agent: {
+				name: "Pi Agent",
+				status: _pi ? "healthy" : "down",
+				version: "0.1.0",
+				model,
+				modelVision,
+				idle,
+				contextPercent,
+				planMode: _planState,
+				permMode: _permMode,
+				cwd: _cwd,
+			},
 			system: {
 				nodeVersion: process.version,
 				platform: process.platform,
@@ -687,27 +681,58 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		return;
 	}
 
-	// Tasks API — proxy to td CLI
-	if (p.startsWith("/td")) {
-		await handleTdApi(req, res, p.slice("/td".length) || "/");
+	// Agent-sent files (pi-lab fork): only paths explicitly registered by the
+	// send_user_file tool are servable — no traversal surface.
+	if (p.startsWith("/files/sent/") && req.method === "GET") {
+		const id = p.slice("/files/sent/".length).split("?")[0];
+		const meta = _sentFiles.get(id);
+		if (!meta) { json(res, 404, { error: "unknown or expired file" }); return; }
+		try {
+			const stat = fs.statSync(meta.path);
+			const url = new URL(req.url ?? "", "http://x");
+			// XSS hardening: only inert raster images render inline on this
+			// (authenticated) origin. SVG/HTML/unknown types are forced to
+			// download as octet-stream; nosniff + sandbox close the rest.
+			const INLINE_SAFE = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+			const wantsDownload = url.searchParams.get("download") === "1";
+			const inline = !wantsDownload && INLINE_SAFE.has(meta.mime);
+			const headers: Record<string, string> = {
+				"Content-Type": INLINE_SAFE.has(meta.mime) ? meta.mime : "application/octet-stream",
+				"Content-Length": String(stat.size),
+				"X-Content-Type-Options": "nosniff",
+				"Content-Security-Policy": "sandbox",
+			};
+			if (!inline) headers["Content-Disposition"] = `attachment; filename="${meta.name.replace(/["\r\n]/g, "")}"`;
+			res.writeHead(200, headers);
+			fs.createReadStream(meta.path).pipe(res);
+		} catch {
+			json(res, 404, { error: "file no longer readable" });
+		}
+		return;
+	}
+
+	// Workspace file download (pi-lab fork) — cwd-restricted like /files/read.
+	if (p === "/files/download" && req.method === "GET") {
+		const url = new URL(req.url ?? "", "http://x");
+		const resolved = safeResolvePath(url.searchParams.get("path") ?? "");
+		if (!resolved || !fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
+			json(res, 404, { error: "not found" });
+			return;
+		}
+		const stat = fs.statSync(resolved);
+		res.writeHead(200, {
+			"Content-Type": "application/octet-stream", // always download, never render on this origin
+			"Content-Length": String(stat.size),
+			"Content-Disposition": `attachment; filename="${path.basename(resolved).replace(/["\r\n]/g, "")}"`,
+			"X-Content-Type-Options": "nosniff",
+		});
+		fs.createReadStream(resolved).pipe(res);
 		return;
 	}
 
 	// Files API — workspace file browser
 	if (p.startsWith("/files")) {
 		await handleFilesApi(req, res, p.slice("/files".length) || "/");
-		return;
-	}
-
-	// CRM API — contact management proxy
-	if (p.startsWith("/crm")) {
-		await handleCrmApi(req, res, p.slice("/crm".length) || "/");
-		return;
-	}
-
-	// Calendar API — event management proxy
-	if (p.startsWith("/calendar")) {
-		await handleCalendarApi(req, res, p.slice("/calendar".length) || "/");
 		return;
 	}
 
@@ -740,12 +765,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		return;
 	}
 
-	// Cron API — job management
-	if (p.startsWith("/cron")) {
-		await handleCronApi(req, res, p.slice("/cron".length) || "/");
-		return;
-	}
-
 	// Logs API — live log streaming
 	if (p === "/logs/events" && req.method === "GET") {
 		res.writeHead(200, {
@@ -772,6 +791,53 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 export function setupMobile(pi: ExtensionAPI) {
 	_pi = pi;
 
+	// send_user_file — the agent pushes a file/screenshot to connected web
+	// clients (Claude-Code-remote style). Images render inline in the chat;
+	// everything else shows as a download card.
+	pi.registerTool({
+		name: "send_user_file",
+		label: "Send file to user",
+		description:
+			"Send a file (screenshot, report, artifact, …) to the user's web/phone chat. Images are shown inline; other files appear as a download card. Use when the file IS the deliverable and the user is (or may be) watching remotely.",
+		parameters: Type.Object({
+			path: Type.String({ description: "Path to an existing file (absolute or relative to cwd)" }),
+			caption: Type.Optional(Type.String({ description: "Short caption shown with the file" })),
+		}),
+		async execute(_id, params) {
+			const resolved = path.isAbsolute(params.path) ? params.path : path.resolve(_cwd, params.path);
+			let stat: fs.Stats;
+			try {
+				stat = fs.statSync(resolved);
+			} catch {
+				return { content: [{ type: "text", text: `File not found: ${resolved}` }], isError: true };
+			}
+			if (stat.isDirectory()) return { content: [{ type: "text", text: `Is a directory: ${resolved}` }], isError: true };
+			if (stat.size > 200 * 1024 * 1024) return { content: [{ type: "text", text: "File too large to send (200MB cap)" }], isError: true };
+			const id = randomBytes(24).toString("base64url");
+			const meta = { path: resolved, name: path.basename(resolved), mime: guessMime(resolved), size: stat.size };
+			_sentFiles.set(id, meta);
+			if (_sentFiles.size > 100) _sentFiles.delete(_sentFiles.keys().next().value!);
+			broadcast({
+				type: "user_file",
+				id,
+				name: meta.name,
+				mime: meta.mime,
+				size: meta.size,
+				caption: params.caption ?? "",
+				time: new Date().toISOString(),
+			});
+			const watchers = sseClients.size;
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Sent ${meta.name} (${Math.round(meta.size / 1024)}KB) to the web chat${watchers ? ` — ${watchers} client(s) connected` : " (no clients connected right now; it will appear when the chat reloads history — mention the path too)"}.`,
+					},
+				],
+			};
+		},
+	});
+
 	function mount(): void {
 		pi.events.emit("web:mount", {
 			name: "mobile",
@@ -794,6 +860,25 @@ export function setupMobile(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		_cwd = ctx.cwd;
 		_lastCtx = ctx;
+		pi.events.emit("plan-mode:get", {}); // ask plan-mode to announce current state
+		pi.events.emit("perm-mode:get", {});
+	});
+
+	pi.events.on("plan-mode:state", (data) => {
+		_planState = data as typeof _planState;
+		broadcast({ type: "plan_state", ...(_planState ?? {}), time: new Date().toISOString() });
+	});
+
+	pi.events.on("perm-mode:state", (data) => {
+		_permMode = (data as { mode?: string })?.mode ?? null;
+		broadcast({ type: "perm_mode", mode: _permMode, time: new Date().toISOString() });
+	});
+
+	// Surface blocking terminal prompts (permission-gating) to web clients —
+	// otherwise the session just looks mysteriously quiet from the phone.
+	pi.events.on("pi-lab:attention", (data) => {
+		const d = (data ?? {}) as { reason?: string; detail?: string };
+		broadcast({ type: "attention", reason: d.reason ?? "attention", detail: d.detail ?? "", time: new Date().toISOString() });
 	});
 
 	// Keep the context fresh so /status reports the CURRENT model (pickers and

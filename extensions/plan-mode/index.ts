@@ -214,23 +214,58 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		savedTools = null;
 	}
 
-	async function togglePlanMode(ctx: ExtensionContext): Promise<void> {
-		planModeEnabled = !planModeEnabled;
+	/**
+	 * Enable plan mode. With modelRef ("provider/id") the model switches
+	 * directly — NO picker. That path exists for non-TTY callers (the web UI):
+	 * a picker would render in the tmux terminal nobody is watching and hang
+	 * the session. Without modelRef, interactive sessions get the picker.
+	 */
+	async function enablePlanMode(ctx: ExtensionContext, explicitModel?: string): Promise<void> {
+		if (planModeEnabled) return;
+		planModeEnabled = true;
 		executionMode = false;
 		todoItems = [];
-
-		if (planModeEnabled) {
-			savedTools = pi.getActiveTools();
-			pi.setActiveTools(PLAN_MODE_TOOLS);
-			ctx.ui.notify(`Plan mode enabled. Tools: ${PLAN_MODE_TOOLS.join(", ")}`);
-			await switchToPlanModel(ctx);
+		savedTools = pi.getActiveTools();
+		pi.setActiveTools(PLAN_MODE_TOOLS);
+		ctx.ui.notify(`Plan mode enabled. Tools: ${PLAN_MODE_TOOLS.join(", ")}`);
+		if (explicitModel) {
+			const before = modelRef(ctx);
+			if (explicitModel !== before && (await applyModel(ctx, explicitModel))) {
+				modelSnapshot = before;
+				writePlanConfig({ lastPlanModel: explicitModel });
+			}
 		} else {
-			restoreTools();
-			await restoreSnapshotModel(ctx);
-			ctx.ui.notify("Plan mode disabled. Full access restored.");
+			await switchToPlanModel(ctx);
 		}
 		persistState();
 		updateStatus(ctx);
+	}
+
+	async function disablePlanMode(ctx: ExtensionContext): Promise<void> {
+		if (!planModeEnabled) return;
+		planModeEnabled = false;
+		executionMode = false;
+		todoItems = [];
+		restoreTools();
+		await restoreSnapshotModel(ctx);
+		ctx.ui.notify("Plan mode disabled. Full access restored.");
+		persistState();
+		updateStatus(ctx);
+	}
+
+	async function togglePlanMode(ctx: ExtensionContext, explicitModel?: string): Promise<void> {
+		if (planModeEnabled) await disablePlanMode(ctx);
+		else await enablePlanMode(ctx, explicitModel);
+	}
+
+	function announceState(): void {
+		// Web UI (mobile.ts) mirrors this into /api/mobile/status.
+		pi.events.emit("plan-mode:state", {
+			enabled: planModeEnabled,
+			executing: executionMode,
+			todosDone: todoItems.filter((t) => t.completed).length,
+			todosTotal: todoItems.length,
+		});
 	}
 
 	function persistState(): void {
@@ -240,11 +275,35 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			executing: executionMode,
 			modelSnapshot,
 		});
+		announceState();
 	}
 
+	// Answer state queries from other extensions (web UI on connect).
+	pi.events.on("plan-mode:get", () => announceState());
+
+	// Web-dispatched commands arrive as bus events ("command:plan"), not via
+	// registerCommand — bridge them. Requires a captured ctx; the web path
+	// always passes an explicit model/off so no picker can hang the TTY.
+	let lastCtx: ExtensionContext | null = null;
+	pi.events.on("command:plan", (data) => {
+		if (!lastCtx) return;
+		const arg = (((data as { args?: string })?.args) ?? "").trim();
+		void (async () => {
+			if (arg === "off") return disablePlanMode(lastCtx!);
+			if (arg && arg !== "on") return enablePlanMode(lastCtx!, arg);
+			return arg === "on" ? enablePlanMode(lastCtx!) : togglePlanMode(lastCtx!);
+		})();
+	});
+
 	pi.registerCommand("plan", {
-		description: "Toggle plan mode (read-only exploration)",
-		handler: async (_args, ctx) => togglePlanMode(ctx),
+		description: "Toggle plan mode: /plan [off | <provider/model-id>]",
+		handler: async (args, ctx) => {
+			const arg = (args ?? "").trim();
+			if (arg === "off") return disablePlanMode(ctx);
+			if (arg === "on") return enablePlanMode(ctx);
+			if (arg) return enablePlanMode(ctx, arg); // explicit model → no picker (web/scripted callers)
+			return togglePlanMode(ctx);
+		},
 	});
 
 	pi.registerCommand("todos", {
@@ -434,6 +493,9 @@ After completing a step, include a [DONE:n] tag in your response.`,
 				// Tools were already restored when Execute was chosen — don't touch them here.
 				updateStatus(ctx);
 				persistState(); // Save cleared state so resume doesn't restore old execution mode
+				// Validation follows generation: the critic extension auto-runs on
+				// this (config critic.auto, default on).
+				pi.events.emit("plan-mode:complete", {});
 			}
 			return;
 		}
@@ -515,6 +577,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
 	// Restore state on session start/resume
 	pi.on("session_start", async (_event, ctx) => {
+		lastCtx = ctx;
 		if (pi.getFlag("plan") === true) {
 			planModeEnabled = true;
 		}

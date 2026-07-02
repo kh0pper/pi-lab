@@ -123,16 +123,26 @@ export default function (pi: ExtensionAPI) {
 		return sessionId ? `${sessionLabel} [${sessionId}]` : sessionLabel;
 	}
 
+	// Web-initiated turns (phone chat) always notify on completion — that's
+	// the "tell me when it replies" contract, independent of run duration.
+	let webInitiated = false;
+	pi.events.on("pi-lab:web-prompt", () => {
+		webInitiated = true;
+	});
+
 	pi.on("agent_start", () => {
 		agentStartedAt = Date.now();
 	});
 
 	pi.on("agent_end", (event) => {
 		if (cfg.onAgentEnd === false) return;
-		if (!agentStartedAt || Date.now() - agentStartedAt < minRunMs) return;
+		const fromWeb = webInitiated;
+		webInitiated = false;
+		const longEnough = agentStartedAt && Date.now() - agentStartedAt >= minRunMs;
+		if (!fromWeb && !longEnough) return;
 		const mins = Math.round((Date.now() - agentStartedAt) / 6000) / 10;
 		const body = lastAssistantText((event as { messages?: unknown }).messages) || "(no final text)";
-		post(`pi finished: ${label()} (${mins}m)`, body, "default", "robot");
+		post(fromWeb ? `pi replied: ${label()}` : `pi finished: ${label()} (${mins}m)`, body, "default", "robot");
 	});
 
 	pi.events.on("pi-lab:attention", (data) => {

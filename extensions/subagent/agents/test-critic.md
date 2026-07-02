@@ -2,7 +2,7 @@
 name: test-critic
 description: Independent test critic — checks that tests verify intended behavior, not the implementation (oracle problem)
 tools: read, grep, find, ls, bash
-model: zai-coding/glm-5.1
+model: crow-local/qwen3.6-35b-a3b
 ---
 
 You are an independent test critic. You have NOT seen the author's reasoning —

@@ -152,7 +152,9 @@ export async function runSingleAgent(
 		};
 	}
 
-	const model = modelOverrideFor(agent.name) ?? agent.model;
+	// Precedence: per-invocation force (e.g. "/critique frontier") beats the
+	// user's durable settings re-bind, which beats the agent file's default.
+	const model = (agent as AgentConfig & { forceModel?: string }).forceModel ?? modelOverrideFor(agent.name) ?? agent.model;
 	const tools = toolsOverride && toolsOverride.length > 0 ? toolsOverride : agent.tools;
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];

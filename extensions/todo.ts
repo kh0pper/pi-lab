@@ -294,4 +294,17 @@ export default function (pi: ExtensionAPI) {
 			});
 		},
 	});
+
+	// Web-dispatched /todos ("command:todos" bus event) — the TUI component
+	// would render in an invisible terminal, so answer in chat instead.
+	// (These are THIS SESSION's todos, not the crow-tasks database.)
+	pi.events.on("command:todos", () => {
+		const list = todos.length
+			? todos.map((t) => `${t.done ? "☑" : "☐"} #${t.id}: ${t.text}`).join("\n")
+			: "_No todos in this session yet._";
+		pi.sendMessage(
+			{ customType: "todos-list", content: `**Session todos**\n\n${list}`, display: true },
+			{ triggerTurn: false },
+		);
+	});
 }
