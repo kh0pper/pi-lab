@@ -421,7 +421,7 @@ async function handleFilesApi(req: IncomingMessage, res: ServerResponse, subPath
 
 			const entries = fs.readdirSync(resolved, { withFileTypes: true });
 			const items = entries
-				.filter(e => !e.name.startsWith(".") && !SKIP_DIRS.has(e.name))
+				.filter(e => !SKIP_DIRS.has(e.name))
 				.map(e => {
 					const fullPath = path.join(resolved, e.name);
 					const relativePath = path.relative(_cwd, fullPath);

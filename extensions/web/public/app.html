@@ -377,7 +377,7 @@
 					`}
 					${sheet === "model" && html`
 						<h3>Switch model</h3>
-						<div class="note">Changes the session's active model${plan?.enabled ? " (you're in plan mode — this changes the planning model)" : ""}. Picking a stopped local model <b>starts its server</b> — big ones take a few minutes to load, and heavyweights swap each other out to fit in RAM. 👁 = can see images.</div>
+						<div class="note">Changes the session's active model${plan?.enabled ? " (you're in plan mode — this changes the planning model)" : ""}. Picking a stopped local model <b>starts its server</b> and stops whichever local model was running — only one runs at a time. Big ones take a few minutes to load. 👁 = can see images.</div>
 						${(models.detailed?.length ? models.detailed : models.models.map((m) => ({ ref: m, local: false }))).map((d) => html`
 							<button class="opt ${d.ref === models.current ? "hot" : ""}" onClick=${() => d.ref !== models.current && switchModel(d.ref)}>
 								${d.ref === models.current ? "current — " : d.local ? (d.running ? "● " : "○ ") : ""}${d.ref}${d.vision ? " 👁" : ""}${d.local && !d.running && d.ref !== models.current ? " — will start server" : ""}
