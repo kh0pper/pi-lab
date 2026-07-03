@@ -27,7 +27,9 @@ import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } fr
 // send_user_file lets those artifacts reach the phone chat (read-only w.r.t.
 // the repo — it only registers an existing file for download).
 const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "ask_user", "subagent", "write", "edit", "send_user_file"];
-const SCRATCH_DIR_NAME = [".pi", "scratch"];
+// Design OUTPUT areas writable in plan mode (override: settings planMode.writableDirs).
+// Mockups, specs, and plans are what the design phase produces — code stays read-only.
+const DEFAULT_WRITABLE_DIRS = [".pi/scratch", ".pi/plans", "docs"];
 // Fallback restore set, used only when no tool snapshot exists (e.g. --plan at startup).
 const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write"];
 // Tools forced onto subagent children spawned from plan mode (scout declares bash;
@@ -42,6 +44,8 @@ interface PlanModeConfig {
 	readOnlyAgents?: string[];
 	/** Persist accepted plans to <repo>/.pi/plans/ (default true). */
 	persistPlans?: boolean;
+	/** Dirs (relative to cwd) where write/edit are allowed in plan mode. */
+	writableDirs?: string[];
 }
 
 const SETTINGS_PATH = resolve(homedir(), ".pi", "agent", "settings.json");
@@ -359,17 +363,21 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (!planModeEnabled) return;
 
-		// write/edit: allowed ONLY inside the design scratch space. Everything
-		// else stays read-only. (Enables mockups/diagrams during brainstorming
-		// without exiting plan mode — pair with send_user_file for the phone.)
+		// write/edit: allowed ONLY inside design-output areas (mockups under
+		// .pi/scratch/, plans under .pi/plans/, specs/design docs under docs/).
+		// Code stays read-only — that is plan mode's actual promise.
 		if (event.toolName === "write" || event.toolName === "edit") {
 			const target = String((event.input as { path?: string }).path ?? "");
-			const scratch = join(ctx.cwd, ...SCRATCH_DIR_NAME);
+			const dirs = readPlanConfig().writableDirs ?? DEFAULT_WRITABLE_DIRS;
 			const resolved = resolve(ctx.cwd, target);
-			if (resolved !== scratch && !resolved.startsWith(scratch + "/")) {
+			const allowed = dirs.some((d) => {
+				const base = resolve(ctx.cwd, d);
+				return resolved === base || resolved.startsWith(base + "/");
+			});
+			if (!allowed) {
 				return {
 					block: true,
-					reason: `Plan mode: project files are read-only. Design artifacts (mockups, diagrams, notes) may be written under ${join(...SCRATCH_DIR_NAME)}/ only — use send_user_file to share them. Blocked path: ${target}`,
+					reason: `Plan mode: code is read-only. Design output may be written under ${dirs.join("/, ")}/ only (mockups → .pi/scratch/, specs & design docs → docs/). Blocked path: ${target}`,
 				};
 			}
 			return;
@@ -448,10 +456,11 @@ You are in plan mode - a read-only exploration mode for safe code analysis.
 
 Restrictions:
 - You can only use: read, bash, grep, find, ls, ask_user, subagent
-- PROJECT files are read-only: write/edit are blocked everywhere EXCEPT the
-  design scratch space .pi/scratch/ — use it for mockups, diagrams, and notes,
-  and share those files with the user via the send_user_file tool (they appear
-  in the web/phone chat). Do NOT ask to exit plan mode to show a mockup.
+- CODE is read-only: write/edit work ONLY in design-output areas —
+  mockups/diagrams/notes → .pi/scratch/ (share via the send_user_file tool;
+  they appear in the web/phone chat), specs & design docs → docs/,
+  plans → .pi/plans/. Do NOT ask to exit plan mode to write a mockup, spec,
+  or design doc — write it directly. Git commits wait until execution.
 - Bash is restricted to an allowlist of read-only commands (no servers)
 
 Ask clarifying questions using the ask_user tool — it renders tappable answer options in the terminal and on the user's phone. Prefer it over plain-text questions whenever the answers are enumerable.
