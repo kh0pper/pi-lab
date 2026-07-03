@@ -315,7 +315,8 @@
 				const h = await api("/chat/history");
 				if (h.error) return;
 				const asks = Array.isArray(h.pendingAsk) ? h.pendingAsk.map((a) => ({ kind: "ask", id: a.id, questions: a.questions })) : [];
-				if ((Array.isArray(h.messages) && h.messages.length) || asks.length) setMsgs([...(h.messages ?? []), ...asks]);
+				const files = Array.isArray(h.sentFiles) ? h.sentFiles.map((f) => ({ kind: "file", id: f.id, name: f.name, mime: f.mime, size: f.size })) : [];
+				if ((Array.isArray(h.messages) && h.messages.length) || asks.length || files.length) setMsgs([...(h.messages ?? []), ...files, ...asks]);
 			}, []);
 
 			// SSE
@@ -641,11 +642,14 @@
 							</div>`;
 							if (m.kind === "file") {
 								const src = APP_BASE + "/api/mobile/files/sent/" + m.id;
+								const viewable = m.mime === "text/html" || m.mime === "image/svg+xml";
+								const rasterInline = m.mime?.startsWith("image/") && m.mime !== "image/svg+xml";
 								return html`<div class="m m-agent m-file">
-									${m.mime?.startsWith("image/") ? html`<a href=${src + "?download=1"}><img class="sent-img" src=${src} alt=${m.name} /></a>` : null}
+									${rasterInline ? html`<a href=${src + "?download=1"}><img class="sent-img" src=${src} alt=${m.name} /></a>` : null}
 									<div class="file-row">
 										<span class="fname">${m.name}</span>
 										<span class="fsize">${m.size > 1048576 ? (m.size / 1048576).toFixed(1) + " MB" : Math.round(m.size / 1024) + " KB"}</span>
+										${viewable && html`<a class="dl" href=${src + "?view=1"} target="_blank" rel="noopener">View</a>`}
 										<a class="dl" href=${src + "?download=1"} download=${m.name}>Download</a>
 									</div>
 									${m.caption ? html`<div class="fcap">${m.caption}</div>` : null}

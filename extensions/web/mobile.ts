@@ -380,7 +380,11 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 			// reload/reconnect (answered synchronously by ask-user.ts).
 			const q: { pending?: Array<{ id: string; questions: unknown }> } = {};
 			_pi?.events.emit("pi-lab:ask-user-pending", q);
-			json(res, 200, { messages: out.slice(-60), pendingAsk: q.pending ?? [] });
+			// Recent agent-sent files re-render too — phone wakes reload
+			// history wholesale, which used to silently eat mockup cards.
+			const sent = [..._sentFiles.entries()].slice(-5)
+				.map(([id, m]) => ({ id, name: m.name, mime: m.mime, size: m.size }));
+			json(res, 200, { messages: out.slice(-60), pendingAsk: q.pending ?? [], sentFiles: sent });
 		} catch (err) {
 			json(res, 200, { messages: [], error: String((err as Error).message ?? err) });
 		}
@@ -809,11 +813,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 			// XSS hardening: only inert raster images render inline on this
 			// (authenticated) origin. SVG/HTML/unknown types are forced to
 			// download as octet-stream; nosniff + sandbox close the rest.
+			// EXCEPTION (?view=1): HTML/SVG mockups render in a fully
+			// sandboxed document — CSP `sandbox` with no allowances puts the
+			// content in an opaque origin with scripts, forms, plugins, and
+			// same-origin access all disabled. Static markup/CSS only, which
+			// is exactly what design mockups need (tailnet-viewable through
+			// the hub, mirroring Claude Code's mockup links).
 			const INLINE_SAFE = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+			const VIEW_SANDBOXED = new Set(["text/html", "image/svg+xml"]);
 			const wantsDownload = url.searchParams.get("download") === "1";
-			const inline = !wantsDownload && INLINE_SAFE.has(meta.mime);
+			const wantsView = url.searchParams.get("view") === "1" && VIEW_SANDBOXED.has(meta.mime) && !wantsDownload;
+			const inline = !wantsDownload && (INLINE_SAFE.has(meta.mime) || wantsView);
 			const headers: Record<string, string> = {
-				"Content-Type": INLINE_SAFE.has(meta.mime) ? meta.mime : "application/octet-stream",
+				"Content-Type": INLINE_SAFE.has(meta.mime) || wantsView ? meta.mime : "application/octet-stream",
 				"Content-Length": String(stat.size),
 				"X-Content-Type-Options": "nosniff",
 				"Content-Security-Policy": "sandbox",
@@ -943,11 +955,14 @@ export function setupMobile(pi: ExtensionAPI) {
 				time: new Date().toISOString(),
 			});
 			const watchers = sseClients.size;
+			const viewNote = meta.mime === "text/html" || meta.mime === "image/svg+xml"
+				? " The card has a View link that renders it in the browser (sandboxed, scripts disabled — keep mockups static HTML+CSS)."
+				: "";
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Sent ${meta.name} (${Math.round(meta.size / 1024)}KB) to the web chat${watchers ? ` — ${watchers} client(s) connected` : " (no clients connected right now; it will appear when the chat reloads history — mention the path too)"}.`,
+						text: `Sent ${meta.name} (${Math.round(meta.size / 1024)}KB) to the web chat${watchers ? ` — ${watchers} client(s) connected` : " (no clients connected right now; it will appear when the chat reloads history — mention the path too)"}.${viewNote}`,
 					},
 				],
 			};
