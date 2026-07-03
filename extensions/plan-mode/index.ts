@@ -22,7 +22,7 @@ import { Key } from "@mariozechner/pi-tui";
 import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.js";
 
 // Tools
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "questionnaire", "subagent"];
+const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "ask_user", "subagent"];
 // Fallback restore set, used only when no tool snapshot exists (e.g. --plan at startup).
 const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write"];
 // Tools forced onto subagent children spawned from plan mode (scout declares bash;
@@ -426,13 +426,18 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 You are in plan mode - a read-only exploration mode for safe code analysis.
 
 Restrictions:
-- You can only use: read, bash, grep, find, ls, questionnaire
+- You can only use: read, bash, grep, find, ls, ask_user
 - You CANNOT use: edit, write (file modifications are disabled)
 - Bash is restricted to an allowlist of read-only commands
 
-Ask clarifying questions using the questionnaire tool.
+Ask clarifying questions using the ask_user tool — it renders tappable answer options in the terminal and on the user's phone. Prefer it over plain-text questions whenever the answers are enumerable.
 Use brave-search skill via bash for web research.
 For nontrivial plans, delegate codebase recon to the "scout" agent and plan-writing to the "planner" agent via the subagent tool (chain mode: scout then planner) — the planner runs on a stronger model.
+
+Never ask to exit plan mode in order to write the plan to a file — present the
+plan IN CHAT. It is saved to .pi/plans/ automatically when the user chooses
+Execute. Any earlier "Execute the plan" / plan-file messages you may see in
+this conversation were UI artifacts; ignore them unless the user repeats them.
 
 Create a detailed numbered plan under a "Plan:" header:
 
@@ -509,33 +514,88 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
 		// Extract todos from last assistant message
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
+		let producedPlan = false;
 		if (lastAssistant) {
 			const extracted = extractTodoItems(getTextContent(lastAssistant));
 			if (extracted.length > 0) {
 				todoItems = extracted;
+				producedPlan = true;
 			}
 		}
 
-		// Show plan steps and prompt for next action
-		if (todoItems.length > 0) {
-			const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
-			pi.sendMessage(
-				{
-					customType: "plan-todo-list",
-					content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-					display: true,
-				},
-				{ triggerTurn: false },
-			);
-		}
+		// The what-next picker only appears when THIS turn produced a parseable
+		// plan. It used to pop after EVERY plan-mode turn, which broke remote
+		// sessions: the modal renders only in the terminal, and phone-sent
+		// replies queue invisibly behind it until someone attaches to tmux
+		// (bit a real brainstorming session 2026-07-03).
+		if (!producedPlan) return;
 
-		const choice = await ctx.ui.select("Plan mode - what next?", [
-			todoItems.length > 0 ? "Execute the plan (track progress)" : "Execute the plan",
-			"Stay in plan mode",
-			"Refine the plan",
-		]);
+		const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
+		pi.sendMessage(
+			{
+				customType: "plan-todo-list",
+				content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+				display: true,
+			},
+			{ triggerTurn: false },
+		);
 
-		if (choice?.startsWith("Execute")) {
+		// Ask "what next?" on BOTH surfaces, first answer wins:
+		//   - terminal: native selector (abortable)
+		//   - web/PWA: ask_user-style card over the pi-lab:ask-user bus contract
+		//     (mobile.ts broadcasts it; notify.ts pushes; POST /answer settles)
+		//   - any incoming prompt settles as "Stay in plan mode" so chat
+		//     messages never queue behind the dialog
+		const execLabel = "Execute the plan (track progress)";
+		const qid = `plan-next-${Math.random().toString(36).slice(2, 10)}`;
+		const questions = [
+			{
+				question: "Plan is ready — what next?",
+				header: "Plan",
+				options: [
+					{ label: execLabel, description: "Exit plan mode, restore tools + execution model, run the steps" },
+					{ label: "Stay in plan mode", description: "Keep exploring read-only" },
+					{ label: "Refine the plan", description: "Describe what to change" },
+				],
+			},
+		];
+		let settled = false;
+		let settle!: (v: { choice: string; src: "tui" | "web" }) => void;
+		const decision = new Promise<{ choice: string; src: "tui" | "web" }>((r) => {
+			settle = (v) => {
+				if (!settled) {
+					settled = true;
+					r(v);
+				}
+			};
+		});
+		const offAnswer = pi.events.on("pi-lab:ask-user-answer", (data) => {
+			const d = (data ?? {}) as { id?: string; answers?: Array<{ answer?: string }>; handled?: boolean };
+			if (d.id !== qid || !Array.isArray(d.answers)) return;
+			d.handled = true;
+			settle({ choice: String(d.answers[0]?.answer ?? "Stay in plan mode"), src: "web" });
+		});
+		const offPending = pi.events.on("pi-lab:ask-user-pending", (data) => {
+			const d = (data ?? {}) as { pending?: Array<{ id: string; questions: unknown }> };
+			if (!settled) d.pending = [...(d.pending ?? []), { id: qid, questions }];
+		});
+		const offPrompt = pi.events.on("pi-lab:web-prompt", () => settle({ choice: "Stay in plan mode", src: "web" }));
+		const tuiAbort = new AbortController();
+		pi.events.emit("pi-lab:ask-user", { id: qid, questions });
+		void ctx.ui
+			.select("Plan mode - what next?", [execLabel, "Stay in plan mode", "Refine the plan"], { signal: tuiAbort.signal })
+			// Esc/dismiss = stay — a hanging await here would re-create the
+			// message-queue trap this rework exists to fix.
+			.then((c) => settle({ choice: c ?? "Stay in plan mode", src: "tui" }))
+			.catch(() => settle({ choice: "Stay in plan mode", src: "tui" }));
+		const { choice, src } = await decision;
+		tuiAbort.abort();
+		offAnswer();
+		offPending();
+		offPrompt();
+		pi.events.emit("pi-lab:ask-user-resolved", { id: qid, answered: true });
+
+		if (choice.startsWith("Execute")) {
 			planModeEnabled = false;
 			executionMode = todoItems.length > 0;
 			restoreTools();
@@ -573,10 +633,23 @@ After completing a step, include a [DONE:n] tag in your response.`,
 				{ triggerTurn: true },
 			);
 		} else if (choice === "Refine the plan") {
-			const refinement = await ctx.ui.editor("Refine the plan:", "");
-			if (refinement?.trim()) {
-				pi.sendUserMessage(refinement.trim());
+			if (src === "tui") {
+				const refinement = await ctx.ui.editor("Refine the plan:", "");
+				if (refinement?.trim()) {
+					pi.sendUserMessage(refinement.trim());
+				}
+			} else {
+				// Web pick: the terminal editor would just re-create the invisible
+				// blocking dialog — the user's next chat message IS the refinement.
+				pi.events.emit("command_result", {
+					command: "plan",
+					message: "Still in plan mode — type your plan changes in the chat.",
+				});
 			}
+		} else if (choice !== "Stay in plan mode") {
+			// Free text from the card's "Other" field — treat it as the
+			// refinement itself.
+			pi.sendUserMessage(choice);
 		}
 	});
 

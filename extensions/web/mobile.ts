@@ -215,6 +215,20 @@ function guessMime(p: string): string {
 	return MIME_BY_EXT[path.extname(p).toLowerCase()] ?? "application/octet-stream";
 }
 
+/** Access log for remote-debugging phone/PWA behavior — which client build
+ * hit which endpoint when. Fire-and-forget appends; ~/.pi/agent/mobile-access.log. */
+const ACCESS_LOG = path.join(process.env["HOME"] ?? "/tmp", ".pi", "agent", "mobile-access.log");
+function logAccess(req: IncomingMessage, note: string): void {
+	try {
+		const url = new URL(req.url ?? "/", "http://x");
+		const b = url.searchParams.get("b") ?? "-";
+		const ua = String(req.headers["user-agent"] ?? "").slice(0, 60);
+		fs.appendFile(ACCESS_LOG, `${new Date().toISOString()} ${note} b=${b} ua="${ua}"\n`, () => {});
+	} catch {
+		// never let logging break a request
+	}
+}
+
 /** Active SSE client connections. */
 const sseClients = new Set<ServerResponse>();
 /** Active log SSE client connections. */
@@ -249,6 +263,7 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 
 	// POST /prompt — submit a prompt (handles slash commands; images allowed → 40MB cap)
 	if (subPath === "/prompt" && req.method === "POST") {
+		logAccess(req, "prompt");
 		try {
 			const body = JSON.parse(await readBody(req, 40 * 1024 * 1024));
 			if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
@@ -327,13 +342,24 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 	// (pi-lab fork: without this, replies that arrive while the phone tab is
 	// backgrounded are simply never seen).
 	if (subPath === "/history" && req.method === "GET") {
+		logAccess(req, "history");
 		try {
 			const entries = (_lastCtx?.sessionManager.getEntries?.() ?? []) as Array<{
 				type: string;
+				customType?: string;
+				content?: unknown;
 				message?: { role?: string; content?: unknown };
 			}>;
 			const out: Array<{ kind: string; text: string }> = [];
 			for (const e of entries) {
+				// Phone-submitted prompts are custom_message entries (customType
+				// "mobile-prompt"), NOT role:"user" messages — without this branch
+				// the user's own messages vanish from the chat on every reload.
+				if (e.type === "custom_message" && e.customType === "mobile-prompt" && typeof e.content === "string") {
+					const t = e.content.replace(/^📱 \*\*Mobile:\*\* /, "").trim();
+					if (t) out.push({ kind: "user", text: t });
+					continue;
+				}
 				if (e.type !== "message" || !e.message) continue;
 				const { role, content } = e.message;
 				let text = "";
@@ -350,15 +376,38 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 				if (role === "user") out.push({ kind: "user", text: text.trim() });
 				else if (role === "assistant") out.push({ kind: "agent", text: text.trim() });
 			}
-			json(res, 200, { messages: out.slice(-60) });
+			// Unanswered ask_user questions re-render as live cards after a
+			// reload/reconnect (answered synchronously by ask-user.ts).
+			const q: { pending?: Array<{ id: string; questions: unknown }> } = {};
+			_pi?.events.emit("pi-lab:ask-user-pending", q);
+			json(res, 200, { messages: out.slice(-60), pendingAsk: q.pending ?? [] });
 		} catch (err) {
 			json(res, 200, { messages: [], error: String((err as Error).message ?? err) });
 		}
 		return;
 	}
 
+	// POST /answer — reply to a pending ask_user question card. Body:
+	// { id, answers: [{ question, answer }] }. Routed to ask-user.ts over the
+	// bus; it settles the blocked tool call (synchronous fill: `handled`).
+	if (subPath === "/answer" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { id?: string; answers?: unknown; handled?: boolean };
+			if (!body.id || !Array.isArray(body.answers)) { json(res, 400, { error: "id and answers[] required" }); return; }
+			if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
+			_pi.events.emit("pi-lab:ask-user-answer", body);
+			if (!body.handled) { json(res, 404, { error: "question expired or already answered" }); return; }
+			json(res, 200, { ok: true });
+		} catch {
+			json(res, 400, { error: "Invalid JSON body" });
+		}
+		return;
+	}
+
 	// SSE stream — broadcast agent events to connected mobile clients
 	if (subPath === "/events" && req.method === "GET") {
+		logAccess(req, "events-open");
+		req.on("close", () => logAccess(req, "events-close"));
 		res.writeHead(200, {
 			"Content-Type": "text/event-stream",
 			"Cache-Control": "no-cache",
@@ -370,10 +419,13 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 		// Register this SSE connection for broadcast
 		sseClients.add(res);
 
-		// Keepalive ping every 15s
+		// Keepalive ping every 15s — a real data event, NOT an SSE comment:
+		// comments never reach EventSource.onmessage, so the client can't
+		// tell a healthy-quiet stream from a zombie connection after the
+		// phone froze the tab. The client reconnects when pings go stale.
 		const keepalive = setInterval(() => {
 			if (!res.writable) { clearInterval(keepalive); return; }
-			try { res.write(": ping\n\n"); } catch { clearInterval(keepalive); sseClients.delete(res); }
+			try { res.write(`data: {"type":"ping"}\n\n`); } catch { clearInterval(keepalive); sseClients.delete(res); }
 		}, 15_000);
 
 		req.on("close", () => {
@@ -473,17 +525,19 @@ async function handleFilesApi(req: IncomingMessage, res: ServerResponse, subPath
 
 // ── Route handlers ───────────────────────────────────────────
 
-function handlePage(_req: IncomingMessage, res: ServerResponse, subPath: string): void {
+function handlePage(req: IncomingMessage, res: ServerResponse, subPath: string): void {
 	const p = subPath.replace(/\/+$/, "") || "/";
 
 	switch (p) {
 		case "/":
+			logAccess(req, "shell");
 			send(res, 200, "text/html; charset=utf-8", APP_HTML);
 			return;
 		case "/manifest.json":
 			send(res, 200, "application/manifest+json; charset=utf-8", MANIFEST_JSON);
 			return;
 		case "/sw.js":
+			logAccess(req, "sw.js");
 			send(res, 200, "application/javascript; charset=utf-8", SW_JS);
 			return;
 		default:
@@ -580,11 +634,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 			const model = _lastCtx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
 			if (!model) { json(res, 404, { error: `unknown model: ${ref}` }); return; }
 
-			const doSwitch = async (): Promise<boolean> => {
-				const ok = await _pi!.setModel(model);
-				if (ok) broadcast({ type: "model_switched", model: ref, time: new Date().toISOString() });
-				return ok;
-			};
+			// model_switched broadcast rides pi's model_select event (below) —
+			// that path also covers plan-mode pickers and /agent-models.
+			const doSwitch = async (): Promise<boolean> => _pi!.setModel(model);
 
 			const managed = readLocalModels()[ref];
 			if (managed) {
@@ -938,6 +990,17 @@ export function setupMobile(pi: ExtensionAPI) {
 		broadcast({ type: "perm_mode", mode: _permMode, time: new Date().toISOString() });
 	});
 
+	// ask_user tool (ask-user.ts) — forward question cards and their
+	// resolution to connected clients.
+	pi.events.on("pi-lab:ask-user", (data) => {
+		const d = (data ?? {}) as { id?: string; questions?: unknown };
+		broadcast({ type: "ask_user", id: d.id, questions: d.questions, time: new Date().toISOString() });
+	});
+	pi.events.on("pi-lab:ask-user-resolved", (data) => {
+		const d = (data ?? {}) as { id?: string; answered?: boolean };
+		broadcast({ type: "ask_user_resolved", id: d.id, answered: d.answered !== false, time: new Date().toISOString() });
+	});
+
 	// Surface blocking terminal prompts (permission-gating) to web clients —
 	// otherwise the session just looks mysteriously quiet from the phone.
 	pi.events.on("pi-lab:attention", (data) => {
@@ -952,6 +1015,16 @@ export function setupMobile(pi: ExtensionAPI) {
 	});
 	pi.on("agent_end", async (_event, ctx) => {
 		_lastCtx = ctx;
+	});
+
+	// ANY model change (plan-mode picker, /agent-models, /model endpoint,
+	// plan-exit restore) → tell connected clients so the header chip updates
+	// immediately instead of waiting for the next agent_end status refresh.
+	pi.on("model_select", async (event, ctx) => {
+		_lastCtx = ctx;
+		const m = event.model as { provider?: string; id?: string } | undefined;
+		if (!m?.provider || !m?.id) return;
+		broadcast({ type: "model_switched", model: `${m.provider}/${m.id}`, source: event.source, time: new Date().toISOString() });
 	});
 
 	// ── SSE event forwarding ──────────────────────────────

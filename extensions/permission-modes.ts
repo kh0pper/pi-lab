@@ -48,7 +48,7 @@ import { isSafeCommand } from "./plan-mode/utils.js";
 
 type Mode = "ask" | "accept-edits" | "auto" | "bypass";
 const MODES: Mode[] = ["ask", "accept-edits", "auto", "bypass"];
-const READ_TOOLS = new Set(["read", "grep", "find", "ls", "questionnaire", "todo", "task_output", "task_kill"]);
+const READ_TOOLS = new Set(["read", "grep", "find", "ls", "ask_user", "todo", "task_output", "task_kill"]);
 const EDIT_TOOLS = new Set(["edit", "write"]);
 
 // Claude's acceptEdits also auto-approves simple file-shuffling commands.

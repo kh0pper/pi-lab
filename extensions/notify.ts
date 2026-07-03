@@ -160,4 +160,14 @@ export default function (pi: ExtensionAPI) {
 		const d = (data ?? {}) as { reason?: string; detail?: string };
 		post(`pi needs input: ${label()}`, `${d.reason ?? "attention"}: ${d.detail ?? ""}`.trim(), "high", "rotating_light");
 	});
+
+	// ask_user tool (ask-user.ts) — the session is blocked on a question card;
+	// answerable from the phone, so this push is the whole point.
+	pi.events.on("pi-lab:ask-user", (data) => {
+		if (cfg.onAttention === false) return;
+		const d = (data ?? {}) as { questions?: Array<{ question?: string }> };
+		const first = d.questions?.[0]?.question ?? "";
+		const more = (d.questions?.length ?? 0) > 1 ? ` (+${d.questions!.length - 1} more)` : "";
+		post(`pi has a question: ${label()}`, `${first}${more}`.trim() || "tap to answer", "high", "question");
+	});
 }

@@ -5,7 +5,7 @@
  * API requests are always network-first (never cached).
  */
 
-const CACHE_NAME = "pi-mobile-v1";
+const CACHE_NAME = "pi-mobile-v3";
 
 const APP_SHELL_URLS = [
 	"/mobile",
@@ -48,20 +48,18 @@ self.addEventListener("fetch", (event) => {
 		return;
 	}
 
-	// App shell — cache-first, fallback to network
+	// App shell — network-first, cache only as offline fallback. Cache-first
+	// (even stale-while-revalidate) meant one full page load on stale UI
+	// after every server-side app.html change — invisible breakage on phones.
 	event.respondWith(
-		caches.match(event.request).then((cached) => {
-			if (cached) {
-				// Return cached version, but update cache in background
-				const bgUpdate = fetch(event.request).then((response) => {
-					if (response.ok) {
-						return caches.open(CACHE_NAME).then((cache) => cache.put(event.request, response));
-					}
-				}).catch(() => {});
-				event.waitUntil(bgUpdate);
-				return cached;
-			}
-			return fetch(event.request);
-		}).catch(() => fetch(event.request))
+		fetch(event.request)
+			.then((response) => {
+				if (response.ok) {
+					const copy = response.clone();
+					event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy)));
+				}
+				return response;
+			})
+			.catch(() => caches.match(event.request).then((cached) => cached ?? Response.error()))
 	);
 });
