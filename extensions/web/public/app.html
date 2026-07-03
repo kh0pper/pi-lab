@@ -315,8 +315,9 @@
 				const h = await api("/chat/history");
 				if (h.error) return;
 				const asks = Array.isArray(h.pendingAsk) ? h.pendingAsk.map((a) => ({ kind: "ask", id: a.id, questions: a.questions })) : [];
-				const files = Array.isArray(h.sentFiles) ? h.sentFiles.map((f) => ({ kind: "file", id: f.id, name: f.name, mime: f.mime, size: f.size })) : [];
-				if ((Array.isArray(h.messages) && h.messages.length) || asks.length || files.length) setMsgs([...(h.messages ?? []), ...files, ...asks]);
+				// file cards arrive INLINE in h.messages (kind:"file"), at their
+				// original conversation position
+				if ((Array.isArray(h.messages) && h.messages.length) || asks.length) setMsgs([...(h.messages ?? []), ...asks]);
 			}, []);
 
 			// SSE

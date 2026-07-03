@@ -350,7 +350,7 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 				content?: unknown;
 				message?: { role?: string; content?: unknown };
 			}>;
-			const out: Array<{ kind: string; text: string }> = [];
+			const out: Array<{ kind: string; text?: string; [k: string]: unknown }> = [];
 			for (const e of entries) {
 				// Phone-submitted prompts are custom_message entries (customType
 				// "mobile-prompt"), NOT role:"user" messages — without this branch
@@ -372,19 +372,45 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 					const imgs = (content as Array<{ type?: string }>).filter((b) => b?.type === "image").length;
 					if (imgs) text = `${text}  📷×${imgs}`.trim();
 				}
-				if (!text.trim()) continue;
-				if (role === "user") out.push({ kind: "user", text: text.trim() });
-				else if (role === "assistant") out.push({ kind: "agent", text: text.trim() });
+				if (text.trim()) {
+					if (role === "user") out.push({ kind: "user", text: text.trim() });
+					else if (role === "assistant") out.push({ kind: "agent", text: text.trim() });
+				}
+				// send_user_file calls re-render as file cards INLINE, at their
+				// original position in the conversation (they used to be tacked
+				// onto the end after reloads). Files whose registration died
+				// with a previous server process are re-registered by path, so
+				// mockup cards survive session restarts too.
+				if (role === "assistant" && Array.isArray(content)) {
+					for (const b of content as Array<{ type?: string; name?: string; arguments?: { path?: string; caption?: string } }>) {
+						if (b?.type !== "toolCall" || b.name !== "send_user_file" || !b.arguments?.path) continue;
+						const resolved = path.isAbsolute(b.arguments.path) ? b.arguments.path : path.resolve(_cwd, b.arguments.path);
+						let id: string | null = null;
+						for (const [k, v] of _sentFiles) if (v.path === resolved) id = k; // latest registration wins
+						if (!id) {
+							try {
+								const st = fs.statSync(resolved);
+								if (!st.isDirectory()) {
+									id = randomBytes(24).toString("base64url");
+									_sentFiles.set(id, { path: resolved, name: path.basename(resolved), mime: guessMime(resolved), size: st.size });
+									if (_sentFiles.size > 100) _sentFiles.delete(_sentFiles.keys().next().value!);
+								}
+							} catch {
+								// file no longer on disk — no card
+							}
+						}
+						if (id) {
+							const meta = _sentFiles.get(id)!;
+							out.push({ kind: "file", id, name: meta.name, mime: meta.mime, size: meta.size, caption: b.arguments.caption ?? "" });
+						}
+					}
+				}
 			}
 			// Unanswered ask_user questions re-render as live cards after a
 			// reload/reconnect (answered synchronously by ask-user.ts).
 			const q: { pending?: Array<{ id: string; questions: unknown }> } = {};
 			_pi?.events.emit("pi-lab:ask-user-pending", q);
-			// Recent agent-sent files re-render too — phone wakes reload
-			// history wholesale, which used to silently eat mockup cards.
-			const sent = [..._sentFiles.entries()].slice(-5)
-				.map(([id, m]) => ({ id, name: m.name, mime: m.mime, size: m.size }));
-			json(res, 200, { messages: out.slice(-60), pendingAsk: q.pending ?? [], sentFiles: sent });
+			json(res, 200, { messages: out.slice(-60), pendingAsk: q.pending ?? [] });
 		} catch (err) {
 			json(res, 200, { messages: [], error: String((err as Error).message ?? err) });
 		}
