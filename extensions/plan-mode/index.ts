@@ -21,8 +21,13 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Key } from "@mariozechner/pi-tui";
 import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.js";
 
-// Tools
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "ask_user", "subagent"];
+// Tools. write/edit are present but path-gated to the design scratch space
+// (.pi/scratch/) by the tool_call handler below — plan mode protects PROJECT
+// files; mockups/diagrams/notes are design artifacts, not code changes.
+// send_user_file lets those artifacts reach the phone chat (read-only w.r.t.
+// the repo — it only registers an existing file for download).
+const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "ask_user", "subagent", "write", "edit", "send_user_file"];
+const SCRATCH_DIR_NAME = [".pi", "scratch"];
 // Fallback restore set, used only when no tool snapshot exists (e.g. --plan at startup).
 const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write"];
 // Tools forced onto subagent children spawned from plan mode (scout declares bash;
@@ -351,8 +356,24 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	});
 
 	// Block destructive bash commands in plan mode
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!planModeEnabled) return;
+
+		// write/edit: allowed ONLY inside the design scratch space. Everything
+		// else stays read-only. (Enables mockups/diagrams during brainstorming
+		// without exiting plan mode — pair with send_user_file for the phone.)
+		if (event.toolName === "write" || event.toolName === "edit") {
+			const target = String((event.input as { path?: string }).path ?? "");
+			const scratch = join(ctx.cwd, ...SCRATCH_DIR_NAME);
+			const resolved = resolve(ctx.cwd, target);
+			if (resolved !== scratch && !resolved.startsWith(scratch + "/")) {
+				return {
+					block: true,
+					reason: `Plan mode: project files are read-only. Design artifacts (mockups, diagrams, notes) may be written under ${join(...SCRATCH_DIR_NAME)}/ only — use send_user_file to share them. Blocked path: ${target}`,
+				};
+			}
+			return;
+		}
 
 		if (event.toolName === "bash") {
 			const command = event.input.command as string;
@@ -426,9 +447,12 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 You are in plan mode - a read-only exploration mode for safe code analysis.
 
 Restrictions:
-- You can only use: read, bash, grep, find, ls, ask_user
-- You CANNOT use: edit, write (file modifications are disabled)
-- Bash is restricted to an allowlist of read-only commands
+- You can only use: read, bash, grep, find, ls, ask_user, subagent
+- PROJECT files are read-only: write/edit are blocked everywhere EXCEPT the
+  design scratch space .pi/scratch/ — use it for mockups, diagrams, and notes,
+  and share those files with the user via the send_user_file tool (they appear
+  in the web/phone chat). Do NOT ask to exit plan mode to show a mockup.
+- Bash is restricted to an allowlist of read-only commands (no servers)
 
 Ask clarifying questions using the ask_user tool — it renders tappable answer options in the terminal and on the user's phone. Prefer it over plain-text questions whenever the answers are enumerable.
 Use brave-search skill via bash for web research.
