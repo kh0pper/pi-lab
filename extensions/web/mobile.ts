@@ -215,6 +215,90 @@ function guessMime(p: string): string {
 	return MIME_BY_EXT[path.extname(p).toLowerCase()] ?? "application/octet-stream";
 }
 
+// ── Markdown → HTML for the sandboxed viewer ─────────────────
+// Deliberately tiny and dependency-free: enough for design specs (headers,
+// lists, tables, fences, inline styles). Escape-first; output is only ever
+// served under CSP `sandbox` (no scripts), so worst case is ugly, not unsafe.
+
+function escapeHtml(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function mdInline(s: string): string {
+	return s
+		.replace(/`([^`]+)`/g, "<code>$1</code>")
+		.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+		.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+		.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+}
+
+function mdToHtml(src: string, title: string): string {
+	const stash: string[] = [];
+	let x = escapeHtml(src.replace(/\r\n/g, "\n"));
+	x = x.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
+		stash.push(code);
+		return `\x00${stash.length - 1}\x00`;
+	});
+	const out: string[] = [];
+	let list: "ul" | "ol" | null = null;
+	let para: string[] = [];
+	const flushPara = () => {
+		if (para.length) out.push(`<p>${mdInline(para.join("<br>"))}</p>`);
+		para = [];
+	};
+	const flushList = () => {
+		if (list) out.push(`</${list}>`);
+		list = null;
+	};
+	const lines = x.split("\n");
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const pre = line.match(/^\x00(\d+)\x00\s*$/);
+		if (pre) { flushPara(); flushList(); out.push(`<pre><code>${stash[Number(pre[1])]}</code></pre>`); continue; }
+		const h = line.match(/^(#{1,6})\s+(.*)$/);
+		if (h) { flushPara(); flushList(); out.push(`<h${h[1].length}>${mdInline(h[2])}</h${h[1].length}>`); continue; }
+		if (/^(-{3,}|\*{3,})\s*$/.test(line)) { flushPara(); flushList(); out.push("<hr>"); continue; }
+		if (/^&gt;\s?/.test(line)) { flushPara(); flushList(); out.push(`<blockquote>${mdInline(line.replace(/^&gt;\s?/, ""))}</blockquote>`); continue; }
+		// tables: header row + |---| separator
+		if (line.includes("|") && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1] ?? "") && (lines[i + 1] ?? "").includes("-")) {
+			flushPara(); flushList();
+			const cells = (l: string) => l.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => mdInline(c.trim()));
+			const rows: string[] = [`<tr>${cells(line).map((c) => `<th>${c}</th>`).join("")}</tr>`];
+			i += 2;
+			while (i < lines.length && lines[i].includes("|")) {
+				rows.push(`<tr>${cells(lines[i]).map((c) => `<td>${c}</td>`).join("")}</tr>`);
+				i++;
+			}
+			i--;
+			out.push(`<table>${rows.join("")}</table>`);
+			continue;
+		}
+		const li = line.match(/^\s*([-*]|\d+\.)\s+(.*)$/);
+		if (li) {
+			flushPara();
+			const want = /^\d+\.$/.test(li[1]) ? "ol" : "ul";
+			if (list !== want) { flushList(); out.push(`<${want}>`); list = want; }
+			out.push(`<li>${mdInline(li[2])}</li>`);
+			continue;
+		}
+		flushList();
+		if (!line.trim()) { flushPara(); continue; }
+		para.push(line);
+	}
+	flushPara(); flushList();
+	return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>
+body{max-width:720px;margin:0 auto;padding:24px 18px 60px;font:16px/1.65 system-ui,sans-serif;color:#22303a;background:#fff}
+h1,h2,h3,h4{line-height:1.3;margin:1.2em 0 .5em}h1{font-size:1.7em}h2{font-size:1.35em}h3{font-size:1.15em}
+p,ul,ol{margin:.6em 0}li{margin:.25em 0}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.88em;background:#eef1f3;padding:1px 5px;border-radius:4px}
+pre{background:#eef1f3;padding:12px;border-radius:8px;overflow-x:auto;font-size:.85em;line-height:1.5}pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:.92em}th,td{border:1px solid #ccd4da;padding:6px 10px;text-align:left;vertical-align:top}
+blockquote{border-left:3px solid #8aa4b0;margin:12px 0;padding:2px 14px;color:#56707c}
+hr{border:0;border-top:1px solid #dde4e8;margin:20px 0}a{color:#0e6b62}
+@media(prefers-color-scheme:dark){body{background:#131a1f;color:#e4ebef}code,pre{background:#1b242b}th,td{border-color:#2a353d}blockquote{color:#8fa0ab;border-color:#46565f}hr{border-color:#2a353d}a{color:#6fd0c4}}
+</style></head><body>${out.join("\n")}</body></html>`;
+}
+
 /** Access log for remote-debugging phone/PWA behavior — which client build
  * hit which endpoint when. Fire-and-forget appends; ~/.pi/agent/mobile-access.log. */
 const ACCESS_LOG = path.join(process.env["HOME"] ?? "/tmp", ".pi", "agent", "mobile-access.log");
@@ -847,11 +931,33 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 			// the hub, mirroring Claude Code's mockup links).
 			const INLINE_SAFE = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 			const VIEW_SANDBOXED = new Set(["text/html", "image/svg+xml"]);
+			// Text formats are viewable too: markdown renders via the built-in
+			// converter (styled, readable on a phone); the rest serve as plain
+			// text. Same CSP sandbox as HTML — scripts stay dead everywhere.
+			const VIEW_AS_TEXT = new Set(["text/plain", "application/json", "text/csv"]);
 			const wantsDownload = url.searchParams.get("download") === "1";
-			const wantsView = url.searchParams.get("view") === "1" && VIEW_SANDBOXED.has(meta.mime) && !wantsDownload;
-			const inline = !wantsDownload && (INLINE_SAFE.has(meta.mime) || wantsView);
+			const viewKind = url.searchParams.get("view") === "1" && !wantsDownload
+				? (VIEW_SANDBOXED.has(meta.mime) ? "raw" : meta.mime === "text/markdown" ? "md" : VIEW_AS_TEXT.has(meta.mime) ? "text" : null)
+				: null;
+
+			if (viewKind === "md" || viewKind === "text") {
+				if (stat.size > 2 * 1024 * 1024) { json(res, 400, { error: "too large to view — download instead" }); return; }
+				const raw = fs.readFileSync(meta.path, "utf-8");
+				const body = viewKind === "md" ? mdToHtml(raw, meta.name) : raw;
+				const buf = Buffer.from(body, "utf-8");
+				res.writeHead(200, {
+					"Content-Type": viewKind === "md" ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+					"Content-Length": String(buf.length),
+					"X-Content-Type-Options": "nosniff",
+					"Content-Security-Policy": "sandbox",
+				});
+				res.end(buf);
+				return;
+			}
+
+			const inline = !wantsDownload && (INLINE_SAFE.has(meta.mime) || viewKind === "raw");
 			const headers: Record<string, string> = {
-				"Content-Type": INLINE_SAFE.has(meta.mime) || wantsView ? meta.mime : "application/octet-stream",
+				"Content-Type": INLINE_SAFE.has(meta.mime) || viewKind === "raw" ? meta.mime : "application/octet-stream",
 				"Content-Length": String(stat.size),
 				"X-Content-Type-Options": "nosniff",
 				"Content-Security-Policy": "sandbox",
@@ -981,8 +1087,8 @@ export function setupMobile(pi: ExtensionAPI) {
 				time: new Date().toISOString(),
 			});
 			const watchers = sseClients.size;
-			const viewNote = meta.mime === "text/html" || meta.mime === "image/svg+xml"
-				? " The card has a View link that renders it in the browser (sandboxed, scripts disabled — keep mockups static HTML+CSS)."
+			const viewNote = ["text/html", "image/svg+xml", "text/markdown", "text/plain", "application/json", "text/csv"].includes(meta.mime)
+				? " The card has a View link that renders it in the browser (sandboxed, scripts disabled — markdown renders styled; keep mockups static HTML+CSS)."
 				: "";
 			return {
 				content: [

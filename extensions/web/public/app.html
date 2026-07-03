@@ -643,7 +643,7 @@
 							</div>`;
 							if (m.kind === "file") {
 								const src = APP_BASE + "/api/mobile/files/sent/" + m.id;
-								const viewable = m.mime === "text/html" || m.mime === "image/svg+xml";
+								const viewable = ["text/html", "image/svg+xml", "text/markdown", "text/plain", "application/json", "text/csv"].includes(m.mime);
 								const rasterInline = m.mime?.startsWith("image/") && m.mime !== "image/svg+xml";
 								return html`<div class="m m-agent m-file">
 									${rasterInline ? html`<a href=${src + "?download=1"}><img class="sent-img" src=${src} alt=${m.name} /></a>` : null}
