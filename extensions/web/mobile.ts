@@ -738,6 +738,54 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		return;
 	}
 
+	// Execution-model bindings (pi-lab fork) — the PWA "Execution models"
+	// card. Roles: "executor" (planMode.execModel, applied at Execute) and
+	// the execution-set agents (settings.subagent.modelOverrides, applied at
+	// each leg spawn). Persisted defaults, live-read — no restart needed.
+	if (p === "/agent-models" && req.method === "GET") {
+		const EXEC_SET = ["scout", "architect", "editor", "worker", "splitter"];
+		const q: { cwd?: string; agents?: Array<{ name: string; model: string | null; override: boolean }> } = { cwd: _cwd };
+		_pi?.events.emit("pi-lab:agent-models-get", q);
+		const agents = (q.agents ?? [])
+			.filter((a) => EXEC_SET.includes(a.name))
+			.sort((a, b) => EXEC_SET.indexOf(a.name) - EXEC_SET.indexOf(b.name));
+		let execModel: string | null = null;
+		try {
+			const raw = JSON.parse(fs.readFileSync(path.join(process.env["HOME"] ?? "", ".pi", "agent", "settings.json"), "utf-8"));
+			execModel = raw.planMode?.execModel ?? null;
+		} catch {
+			// unreadable settings — executor shows unset
+		}
+		const refs = [...new Set([execModel, ...agents.map((a) => a.model)].filter(Boolean))] as string[];
+		json(res, 200, { executor: { model: execModel }, agents, bound: await annotate(refs) });
+		return;
+	}
+
+	if (p === "/agent-models" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { role?: string; model?: string | null };
+			const role = (body.role ?? "").trim();
+			const model = body.model === null ? null : (body.model ?? "").trim();
+			if (!role) { json(res, 400, { error: "role required" }); return; }
+			if (!_pi || !_lastCtx) { json(res, 503, { error: "Agent not ready" }); return; }
+			if (model !== null) {
+				const slash = model.indexOf("/");
+				if (slash <= 0 || !_lastCtx.modelRegistry.find(model.slice(0, slash), model.slice(slash + 1))) {
+					json(res, 404, { error: `unknown model: ${model}` });
+					return;
+				}
+			}
+			const q: { cwd?: string; agent?: string; model?: string | null; ok?: boolean; error?: string } =
+				role === "executor" ? { model } : { cwd: _cwd, agent: role, model };
+			_pi.events.emit(role === "executor" ? "pi-lab:exec-model-set" : "pi-lab:agent-models-set", q);
+			if (!q.ok) { json(res, q.error?.startsWith("unknown agent") ? 404 : 503, { error: q.error ?? "extension not loaded" }); return; }
+			json(res, 200, { ok: true, role, model });
+		} catch {
+			json(res, 400, { error: "Invalid JSON body" });
+		}
+		return;
+	}
+
 	if (p === "/model" && req.method === "POST") {
 		try {
 			const body = JSON.parse(await readBody(req)) as { model?: string };

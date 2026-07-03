@@ -304,6 +304,8 @@
 			const [sheet, setSheet] = useState(null); // null | "plan"
 			const [models, setModels] = useState({ models: [], detailed: [], current: null });
 			const [starting, setStarting] = useState(null); // provider/id being started
+			const [execModels, setExecModels] = useState(null); // executor + agent bindings
+			const [modelRole, setModelRole] = useState(null); // role being re-bound in the sheet
 			const [permMode, setPermMode] = useState(null);
 			const [acts, setActs] = useState([]);
 			const msgsRef = useRef(null);
@@ -403,10 +405,38 @@
 
 			// sheet: null | "plan" (pick planning model, enters plan mode)
 			//             | "model" (pick active model, direct switch)
+			//             | "agent-model" (re-bind executor/agent default)
 			const openSheet = async (kind) => {
 				const m = await api("/models");
 				if (!m.error) setModels(m);
 				setSheet(kind);
+			};
+			const loadExecModels = useCallback(() => api("/agent-models").then((r) => { if (!r.error) setExecModels(r); }), []);
+			const pickRole = (role) => { setModelRole(role); openSheet("agent-model"); };
+			// Set a binding. Local models share ONE server slot — picking a local
+			// model while other roles are bound to a DIFFERENT local one offers an
+			// atomic swap (move them all) instead of silently creating a config
+			// that thrashes the llama.cpp server on every leg.
+			const setRoleModel = async (ref) => {
+				setSheet(null);
+				const known = [...(models.detailed ?? []), ...(execModels?.bound ?? [])];
+				const isLocal = (r) => known.some((x) => x.ref === r && x.local);
+				let updates = [{ role: modelRole, model: ref }];
+				if (ref && isLocal(ref)) {
+					const bindings = [["executor", execModels?.executor?.model], ...(execModels?.agents ?? []).map((a) => [a.name, a.model])];
+					const conflicted = bindings.filter(([role, m]) => role !== modelRole && m && m !== ref && isLocal(m));
+					if (conflicted.length) {
+						const names = conflicted.map(([r]) => r).join(", ");
+						if (!confirm(`Local models share one server slot — ${ref.split("/").pop()} evicts ${conflicted[0][1].split("/").pop()}, breaking roles still bound to it.\n\nMove ${names} to ${ref.split("/").pop()} too? (Cancel changes nothing.)`)) return;
+						updates = updates.concat(conflicted.map(([role]) => ({ role, model: ref })));
+					}
+				}
+				for (const u of updates) {
+					const r = await post("/agent-models", u);
+					if (r?.error) { alert(`${u.role}: ${r.error}`); break; }
+				}
+				loadExecModels();
+				addMsg({ kind: "sys", text: `${updates.map((u) => u.role).join(", ")} → ${ref ? ref.split("/").pop() : "default"}` });
 			};
 			const toNormal = () => {
 				if (!plan?.enabled) return;
@@ -466,7 +496,7 @@
 
 				<div class="content">
 					${tab === "chat" && html`<${Chat} msgs=${msgs} busy=${busy} onSend=${send} msgsRef=${msgsRef} />`}
-					${tab === "session" && html`<${Session} status=${status} plan=${plan} refresh=${refreshStatus} send=${send} openSheet=${openSheet} />`}
+					${tab === "session" && html`<${Session} status=${status} plan=${plan} refresh=${refreshStatus} send=${send} openSheet=${openSheet} em=${execModels} pickRole=${pickRole} loadEm=${loadExecModels} />`}
 					${tab === "files" && html`<${Files} />`}
 					${tab === "activity" && html`<${Activity} acts=${acts} />`}
 				</div>
@@ -504,6 +534,13 @@
 								refreshStatus();
 							}}>${status?.agent?.classifier?.fallback === val ? "current — " : ""}${label}</button>
 						`)}
+					`}
+					${sheet === "agent-model" && modelRole && html`
+						<h3>${modelRole === "executor" ? "Executor model (applied when a plan Executes)" : `Model for ${modelRole} legs`}</h3>
+						<div class="note">Persists as the default; legs pick it up on their next spawn. ● running local · ○ stopped local — local models share <b>one</b> server slot, so a different local pick offers to move all local-bound roles together.</div>
+						<button class="opt" onClick=${() => setRoleModel(null)}>${modelRole === "executor" ? "Clear — restore pre-plan model at Execute" : "Clear override — use agent-file default"}</button>
+						${(models.detailed?.length ? models.detailed : models.models.map((m) => ({ ref: m, local: false }))).map((d) => html`
+							<button class="opt" onClick=${() => setRoleModel(d.ref)}>${d.local ? (d.running ? "● " : "○ ") : ""}${d.ref}</button>`)}
 					`}
 					${sheet === "model" && html`
 						<h3>Switch model</h3>
@@ -686,9 +723,11 @@
 			`;
 		}
 
-		function Session({ status, plan, refresh, send, openSheet }) {
-			useEffect(() => { refresh(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
+		function Session({ status, plan, refresh, send, openSheet, em, pickRole, loadEm }) {
+			useEffect(() => { refresh(); loadEm(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
 			const a = status?.agent ?? {}; const s = status?.system ?? {};
+			const dot = (m) => { const d = (em?.bound ?? []).find((x) => x.ref === m); return d?.local ? (d.running ? "● " : "○ ") : ""; };
+			const short = (m) => m ? m.split("/").pop() : null;
 			const rename = async () => {
 				const name = prompt("Session name (empty clears it):", a.sessionName || "");
 				if (name === null) return;
@@ -718,6 +757,13 @@
 					${plan?.todosTotal > 0 && html`
 						<div class="card"><h3>Plan progress — ${plan.todosDone}/${plan.todosTotal}</h3></div>
 					`}
+					<div class="card">
+						<h3>Execution models</h3>
+						<div class="kv"><span class="k">executor</span><span class="v" style="cursor:pointer;text-decoration:underline dotted" onClick=${() => pickRole("executor")}>${em ? (em.executor?.model ? dot(em.executor.model) + short(em.executor.model) : "pre-plan restore") : "…"}</span></div>
+						${(em?.agents ?? []).map((ag) => html`
+							<div class="kv"><span class="k">${ag.name}${ag.override ? " *" : ""}</span><span class="v" style="cursor:pointer;text-decoration:underline dotted" onClick=${() => pickRole(ag.name)}>${ag.model ? dot(ag.model) + short(ag.model) : "inherit session"}</span></div>`)}
+						<div class="note" style="margin:8px 2px 2px;color:var(--faint);font-size:11.5px">tap to re-bind · * = settings override · ●/○ local run state · legs apply on next spawn, executor at Execute</div>
+					</div>
 					<div class="card">
 						<h3>Quick actions</h3>
 						<div class="actions">

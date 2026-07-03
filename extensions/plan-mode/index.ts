@@ -200,6 +200,18 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		persistState();
 	}
 
+	// Web bridge (PWA "Execution models" card): set/clear the default
+	// execution model. null clears → Execute restores the pre-plan model.
+	pi.events.on("pi-lab:exec-model-set", (data) => {
+		const d = (data ?? {}) as { model?: string | null; ok?: boolean; error?: string };
+		try {
+			writePlanConfig({ execModel: (d.model ?? null) as unknown as string });
+			d.ok = true;
+		} catch (err) {
+			d.error = String((err as Error).message ?? err);
+		}
+	});
+
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only exploration)",
 		type: "boolean",

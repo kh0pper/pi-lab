@@ -35,6 +35,30 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 
+const SETTINGS_JSON = path.join(os.homedir(), ".pi", "agent", "settings.json");
+
+/** settings.subagent.modelOverrides, fresh from disk. */
+function readModelOverrides(): Record<string, string> {
+	try {
+		const raw = JSON.parse(fs.readFileSync(SETTINGS_JSON, "utf8")) as {
+			subagent?: { modelOverrides?: Record<string, string> };
+		};
+		return raw.subagent?.modelOverrides ?? {};
+	} catch {
+		return {};
+	}
+}
+
+/** Persist (or clear, with null) one agent's model override. Throws on I/O failure. */
+function writeModelOverride(agentName: string, model: string | null): void {
+	const raw = fs.existsSync(SETTINGS_JSON) ? (JSON.parse(fs.readFileSync(SETTINGS_JSON, "utf8")) as Record<string, any>) : {};
+	raw.subagent = raw.subagent ?? {};
+	raw.subagent.modelOverrides = raw.subagent.modelOverrides ?? {};
+	if (agentName in raw.subagent.modelOverrides && model === null) delete raw.subagent.modelOverrides[agentName];
+	else if (model !== null) raw.subagent.modelOverrides[agentName] = model;
+	fs.writeFileSync(SETTINGS_JSON, JSON.stringify(raw, null, 2));
+}
+
 interface SubagentSettings {
 	maxStepsPerLeg?: number;
 	decomposeOnFailure?: boolean;
@@ -265,6 +289,41 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// Web bridge for agent model bindings (PWA "Execution models" card).
+	// registerCommand handlers don't fire for web-dispatched commands, so the
+	// phone drives these over the bus (sync-fill pattern, like classifier-set).
+	pi.events.on("pi-lab:agent-models-get", (data) => {
+		const d = (data ?? {}) as {
+			cwd?: string;
+			agents?: Array<{ name: string; model: string | null; override: boolean }>;
+		};
+		try {
+			const overrides = readModelOverrides();
+			const { agents } = discoverAgents(d.cwd ?? process.cwd(), "user");
+			d.agents = agents.map((a) => ({
+				name: a.name,
+				model: overrides[a.name] ?? a.model ?? null,
+				override: Boolean(overrides[a.name]),
+			}));
+		} catch {
+			d.agents = [];
+		}
+	});
+	pi.events.on("pi-lab:agent-models-set", (data) => {
+		const d = (data ?? {}) as { cwd?: string; agent?: string; model?: string | null; ok?: boolean; error?: string };
+		try {
+			const { agents } = discoverAgents(d.cwd ?? process.cwd(), "user");
+			if (!d.agent || !agents.some((a) => a.name === d.agent)) {
+				d.error = `unknown agent: ${d.agent}`;
+				return;
+			}
+			writeModelOverride(d.agent, d.model ?? null);
+			d.ok = true;
+		} catch (err) {
+			d.error = String((err as Error).message ?? err);
+		}
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
