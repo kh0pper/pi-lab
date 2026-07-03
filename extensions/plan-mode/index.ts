@@ -14,12 +14,12 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
-import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.js";
+import { extractHeaderTasks, extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.js";
 
 // Tools. write/edit are present but path-gated to the design scratch space
 // (.pi/scratch/) by the tool_call handler below — plan mode protects PROJECT
@@ -92,6 +92,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	// Tool set snapshotted on plan-mode entry, restored on exit — hardcoding the
 	// restore set would drop subagent/todo/MCP tools for the rest of the session.
 	let savedTools: string[] | null = null;
+	/** Plan file written/edited during the current turn (path under a /plans/ dir). */
+	let planFileWritten: string | null = null;
 	// "provider/id" of the model active before plan mode switched it; null = nothing to restore.
 	let modelSnapshot: string | null = null;
 
@@ -155,8 +157,21 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		modelSnapshot = null;
 	}
 
-	async function switchToExecModel(ctx: ExtensionContext): Promise<void> {
+	async function switchToExecModel(ctx: ExtensionContext, interactive = true): Promise<void> {
 		const cfg = readPlanConfig();
+		if (!interactive) {
+			// Web/phone-driven Execute: never pop the terminal picker (it is
+			// invisible remotely and blocks the session). execModel config
+			// wins; otherwise restore the pre-plan model.
+			if (cfg.execModel) {
+				await applyModel(ctx, cfg.execModel);
+				modelSnapshot = null;
+			} else {
+				await restoreSnapshotModel(ctx);
+			}
+			persistState();
+			return;
+		}
 		if (ctx.hasUI) {
 			const restoreOpt = modelSnapshot ? `Restore pre-plan model (${modelSnapshot})` : null;
 			const available = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
@@ -380,6 +395,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					reason: `Plan mode: code is read-only. Design output may be written under ${dirs.join("/, ")}/ only (mockups → .pi/scratch/, specs & design docs → docs/). Blocked path: ${target}`,
 				};
 			}
+			// A write into a plans dir means this turn produced/refined THE PLAN
+			// — agent_end uses it to pop the what-next card without requiring a
+			// "Plan:" section pasted into chat.
+			if (resolved.includes("/plans/")) planFileWritten = resolved;
 			return;
 		}
 
@@ -556,6 +575,26 @@ After completing a step, include a [DONE:n] tag in your response.`,
 			}
 		}
 
+		// Plans usually live in FILES (superpowers writes docs/superpowers/
+		// plans/<date>-<topic>.md), not as "Plan:" sections pasted into chat —
+		// a plan-file write this turn counts as producing the plan, and its
+		// Task/Step headers become the tracked steps.
+		let planSourceFile: string | null = null;
+		if (planFileWritten) {
+			planSourceFile = planFileWritten;
+			planFileWritten = null;
+			if (!producedPlan) {
+				try {
+					const fileText = readFileSync(planSourceFile, "utf8");
+					const extracted = extractTodoItems(fileText);
+					todoItems = extracted.length > 0 ? extracted : extractHeaderTasks(fileText);
+					producedPlan = true;
+				} catch {
+					planSourceFile = null; // unreadable — treat as no plan
+				}
+			}
+		}
+
 		// The what-next picker only appears when THIS turn produced a parseable
 		// plan. It used to pop after EVERY plan-mode turn, which broke remote
 		// sessions: the modal renders only in the terminal, and phone-sent
@@ -563,15 +602,17 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		// (bit a real brainstorming session 2026-07-03).
 		if (!producedPlan) return;
 
-		const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
-		pi.sendMessage(
-			{
-				customType: "plan-todo-list",
-				content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-				display: true,
-			},
-			{ triggerTurn: false },
-		);
+		if (todoItems.length > 0) {
+			const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
+			pi.sendMessage(
+				{
+					customType: "plan-todo-list",
+					content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+					display: true,
+				},
+				{ triggerTurn: false },
+			);
+		}
 
 		// Ask "what next?" on BOTH surfaces, first answer wins:
 		//   - terminal: native selector (abortable)
@@ -579,11 +620,11 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		//     (mobile.ts broadcasts it; notify.ts pushes; POST /answer settles)
 		//   - any incoming prompt settles as "Stay in plan mode" so chat
 		//     messages never queue behind the dialog
-		const execLabel = "Execute the plan (track progress)";
+		const execLabel = todoItems.length > 0 ? `Execute the plan (${todoItems.length} steps, tracked)` : "Execute the plan";
 		const qid = `plan-next-${Math.random().toString(36).slice(2, 10)}`;
 		const questions = [
 			{
-				question: "Plan is ready — what next?",
+				question: `Plan is ready${planSourceFile ? ` (${basename(planSourceFile)})` : ""} — what next?`,
 				header: "Plan",
 				options: [
 					{ label: execLabel, description: "Exit plan mode, restore tools + execution model, run the steps" },
@@ -632,14 +673,18 @@ After completing a step, include a [DONE:n] tag in your response.`,
 			planModeEnabled = false;
 			executionMode = todoItems.length > 0;
 			restoreTools();
-			await switchToExecModel(ctx);
+			// Execute picked from the phone: the TUI model picker would be
+			// another invisible blocking dialog — resolve non-interactively
+			// (configured execModel, else restore the pre-plan model).
+			await switchToExecModel(ctx, src === "tui");
 			updateStatus(ctx);
 
 			// B3 (tenet port): persist the accepted plan so executors and
 			// /critique can read the spec — this session's reasoning isn't
 			// available to fresh-context subagents, but this file is.
-			let planPath: string | null = null;
-			if (readPlanConfig().persistPlans !== false && lastAssistant) {
+			// A model-written plan file IS the spec — reference it directly.
+			let planPath: string | null = planSourceFile;
+			if (!planPath && readPlanConfig().persistPlans !== false && lastAssistant) {
 				try {
 					const plansDir = join(ctx.cwd, ".pi", "plans");
 					mkdirSync(plansDir, { recursive: true });

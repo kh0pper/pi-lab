@@ -166,3 +166,18 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	}
 	return doneSteps.length;
 }
+
+/**
+ * Extract tasks from a plan FILE (superpowers-style markdown): "## Task N:",
+ * "### Step N", "## Phase N" headers. Fallback when the chat message carries
+ * no "Plan:" section because the plan lives in a document.
+ */
+export function extractHeaderTasks(text: string): TodoItem[] {
+	const items: TodoItem[] = [];
+	for (const m of text.matchAll(/^#{2,4}\s*(?:Task|Step|Phase)\s*\d+[:.)\s-]*(.*)$/gim)) {
+		const raw = (m[1] ?? "").trim().replace(/\*+/g, "");
+		const cleaned = cleanStepText(raw) || raw;
+		if (cleaned.length > 2) items.push({ step: items.length + 1, text: cleaned.slice(0, 200), completed: false });
+	}
+	return items;
+}
