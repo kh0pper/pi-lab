@@ -768,6 +768,7 @@
 						<div class="kv"><span class="k">model</span><span class="v">${a.model ?? "—"}</span></div>
 						<div class="kv"><span class="k">mode</span><span class="v">${plan?.enabled ? "plan (read-only)" : plan?.executing ? "executing plan" : "normal"}</span></div>
 						<div class="kv"><span class="k">state</span><span class="v">${a.idle === false ? "working" : "idle"}</span></div>
+						<div class="kv"><span class="k">context</span><span class="v">${a.contextPercent != null ? `${Math.round(a.contextPercent)}%` : "—"}${a.contextTokens != null && a.contextWindow ? ` · ${Math.round(a.contextTokens / 1000)}k/${Math.round(a.contextWindow / 1000)}k` : ""}</span></div>
 						<div class="kv"><span class="k">cwd</span><span class="v">${a.cwd ?? "—"}</span></div>
 						<div class="kv"><span class="k">uptime</span><span class="v">${s.uptimeSeconds ? Math.round(s.uptimeSeconds / 60) + "m" : "—"}</span></div>
 						<div class="kv"><span class="k">memory</span><span class="v">${s.memoryMB ? s.memoryMB + " MB" : "—"}</span></div>

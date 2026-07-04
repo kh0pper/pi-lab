@@ -488,8 +488,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	// Inject plan/execution context before agent starts
 	pi.on("before_agent_start", async () => {
 		if (planModeEnabled) {
-			const cfgExec = readPlanConfig().execModel;
-			const execModelNote = cfgExec ? ` (${cfgExec})` : " (the pre-plan model)";
 			return {
 				message: {
 					customType: "plan-mode-context",
@@ -521,8 +519,9 @@ THE LIFECYCLE — know where you are and what comes next:
    says "start implementing now", that applies only AFTER the user picks
    Execute. Finish the plan → end the turn → wait for the card.
 3. EXECUTION (if the user picks Execute): plan mode exits FOR you — full
-   tools restored, the session switched to the execution model${execModelNote} —
-   and you receive the instruction to begin. Steps are tracked ([DONE:n]
+   tools restored, the session switched to the configured execution model
+   (typically a smaller LOCAL model) — and you receive the instruction to
+   begin. Steps are tracked ([DONE:n]
    markers drive the user's progress bar), implementation is delegated to
    local subagent chains (scout → architect → editor), failed legs auto-split
    into smaller sub-steps, and independent critics review the diff at the end.

@@ -907,6 +907,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		let model: string | null = null;
 		let idle: boolean | null = null;
 		let contextPercent: number | null = null;
+		let contextTokens: number | null = null;
+		let contextWindow: number | null = null;
 		let modelVision = false;
 		let sessionId: string | null = null;
 		let sessionName: string | null = null;
@@ -914,6 +916,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 		try {
 			model = _lastCtx?.model ? `${_lastCtx.model.provider}/${_lastCtx.model.id}` : null;
 			idle = _lastCtx?.isIdle() ?? null;
+			const usage = _lastCtx?.getContextUsage?.();
+			if (usage) {
+				contextPercent = usage.percent;
+				contextTokens = usage.tokens;
+				contextWindow = usage.contextWindow;
+			}
 			const input = (_lastCtx?.model as { input?: string[] } | undefined)?.input;
 			modelVision = Array.isArray(input) && input.includes("image");
 			sessionId = _lastCtx?.sessionManager?.getSessionId?.() ?? null;
@@ -931,6 +939,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 				modelVision,
 				idle,
 				contextPercent,
+				contextTokens,
+				contextWindow,
 				planMode: _planState,
 				permMode: _permMode,
 				cwd: _cwd,
