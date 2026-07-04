@@ -390,6 +390,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (!planModeEnabled) return;
 
+		// Once THIS turn has produced the plan, every further block teaches
+		// the handoff instead of inviting workaround attempts — the runaway
+		// pattern is the model grinding against plan mode trying to execute.
+		const handoffHint = planFileWritten
+			? " NOTE: the plan is written — END YOUR TURN now. The user then gets an Execute card that exits plan mode and starts execution properly; do not attempt anything else."
+			: "";
+
 		// write/edit: allowed ONLY inside design-output areas (mockups under
 		// .pi/scratch/, plans under .pi/plans/, specs/design docs under docs/).
 		// Code stays read-only — that is plan mode's actual promise.
@@ -404,7 +411,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			if (!allowed) {
 				return {
 					block: true,
-					reason: `Plan mode: code is read-only. Design output may be written under ${dirs.join("/, ")}/ only (mockups → .pi/scratch/, specs & design docs → docs/). Blocked path: ${target}`,
+					reason: `Plan mode: code is read-only. Design output may be written under ${dirs.join("/, ")}/ only (mockups → .pi/scratch/, specs & design docs → docs/). Blocked path: ${target}${handoffHint}`,
 				};
 			}
 			// A write into a plans dir means this turn produced/refined THE PLAN
@@ -419,7 +426,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			if (!isSafeCommand(command)) {
 				return {
 					block: true,
-					reason: `Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\nCommand: ${command}`,
+					reason: `Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.${handoffHint}\nCommand: ${command}`,
 				};
 			}
 			return;
@@ -444,7 +451,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			if (disallowed.length > 0) {
 				return {
 					block: true,
-					reason: `Plan mode: only read-only agents allowed (${allowed.join(", ")}). Blocked: ${disallowed.join(", ")}.`,
+					reason: `Plan mode: only read-only agents allowed (${allowed.join(", ")}). Blocked: ${disallowed.join(", ")}.${handoffHint}`,
 				};
 			}
 			// event.input is mutable by contract — enforce read-only children.
@@ -498,19 +505,24 @@ Ask clarifying questions using the ask_user tool — it renders tappable answer 
 Use brave-search skill via bash for web research.
 For nontrivial plans, delegate codebase recon to the "scout" agent and plan-writing to the "planner" agent via the subagent tool (chain mode: scout then planner) — the planner runs on a stronger model.
 
-Never ask to exit plan mode in order to write the plan to a file — present the
-plan IN CHAT. It is saved to .pi/plans/ automatically when the user chooses
-Execute. Any earlier "Execute the plan" / plan-file messages you may see in
-this conversation were UI artifacts; ignore them unless the user repeats them.
+THE PLAN → EXECUTION HANDOFF (read carefully):
+Write the final plan to a plans file (docs/plans/, docs/superpowers/plans/, or
+.pi/plans/) — or, for small plans, present it in chat under a "Plan:" header
+with numbered steps ("1. …"). Either way, the moment the plan is final:
+ANNOUNCE IT AND END YOUR TURN. The harness then shows the user an
+Execute / Stay / Refine card (in the terminal AND on their phone). If they
+choose Execute, plan mode exits FOR you: full tools are restored, the
+execution model is applied, and you receive the instruction to begin.
 
-Create a detailed numbered plan under a "Plan:" header:
+NEVER try to start execution yourself while plan mode is active — dispatching
+implementation subagents, scaffolding files, running setup commands, or asking
+"how should I proceed?" are all dead ends here: every attempt is blocked, and
+the questions are redundant because the Execute card already exists. Even if
+the plan document or a skill says "use subagent-driven development NOW", in
+plan mode that instruction applies only AFTER the user picks Execute.
+Finish the plan → end the turn → wait for the card.
 
-Plan:
-1. First step description
-2. Second step description
-...
-
-Do NOT attempt to make changes - just describe what you would do.`,
+Do NOT attempt to make code changes - just describe what you would do.`,
 					display: false,
 				},
 			};
