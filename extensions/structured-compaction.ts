@@ -164,6 +164,23 @@ export default function (pi: ExtensionAPI) {
 	const settings = loadSettings();
 	if (!settings.enabled) return;
 
+	// A session resumed at/over the context limit cannot even run its next
+	// turn (the provider rejects the oversized prompt and pi's in-turn
+	// auto-compaction never gets a chance). Compact proactively on resume.
+	// Bit a real overnight build 2026-07-04: resumed at 100.0%, every nudge
+	// errored silently until a manual /compact.
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const usage = ctx.getContextUsage?.();
+			if (usage?.percent != null && usage.percent >= 97) {
+				ctx.ui.notify(`Context at ${Math.round(usage.percent)}% on resume - compacting before the next turn`, "warning");
+				ctx.compact();
+			}
+		} catch {
+			// never block session start
+		}
+	});
+
 	pi.on("session_compact", (event) => {
 		const summary = event.compactionEntry?.summary;
 		if (!summary || typeof summary !== "string") return;

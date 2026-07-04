@@ -163,7 +163,7 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	// Models narrate completion more often than they emit the [DONE:n] tag
 	// ("Task 7 complete ✅ — …"). Accept the natural phrasing too so the
 	// progress bar tracks reality.
-	for (const m of text.matchAll(/(?:task|step)\s+(\d+)\s+(?:is\s+)?(?:complete|completed|done|finished)/gi)) {
+	for (const m of text.matchAll(/\b(?:task|step)\s+(\d+)\s+(?:is\s+)?(?:complete|completed|done|finished)\b/gi)) {
 		doneSteps.push(Number.parseInt(m[1], 10));
 	}
 	for (const step of doneSteps) {
