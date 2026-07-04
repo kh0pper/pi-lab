@@ -443,6 +443,20 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 				content?: unknown;
 				message?: { role?: string; content?: unknown };
 			}>;
+			// Pre-scan tool results so chips can carry their outcome + output.
+			const toolResults = new Map<string, { err: boolean; result: string }>();
+			for (const e of entries) {
+				const m = e.message as { role?: string; toolCallId?: string; isError?: boolean; content?: unknown } | undefined;
+				if (e.type !== "message" || m?.role !== "toolResult" || !m.toolCallId) continue;
+				let result = "";
+				if (Array.isArray(m.content)) {
+					result = (m.content as Array<{ type?: string; text?: string }>)
+						.filter((b) => b?.type === "text" && typeof b.text === "string")
+						.map((b) => b.text)
+						.join("\n");
+				} else if (typeof m.content === "string") result = m.content;
+				toolResults.set(m.toolCallId, { err: m.isError === true, result: result.slice(0, 2000) });
+			}
 			const out: Array<{ kind: string; text?: string; [k: string]: unknown }> = [];
 			for (const e of entries) {
 				// Phone-submitted prompts are custom_message entries (customType
@@ -469,12 +483,25 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 					if (role === "user") out.push({ kind: "user", text: text.trim() });
 					else if (role === "assistant") out.push({ kind: "agent", text: text.trim() });
 				}
-				// send_user_file calls re-render as file cards INLINE, at their
-				// original position in the conversation (they used to be tacked
-				// onto the end after reloads). Files whose registration died
-				// with a previous server process are re-registered by path, so
-				// mockup cards survive session restarts too.
+				// Tool calls re-render as persistent chips INLINE with their args +
+				// result attached (tap-to-expand in the PWA) — live-only chips
+				// used to vanish on every reload. send_user_file renders as a
+				// file card instead (below); files whose registration died with
+				// a previous server process are re-registered by path.
 				if (role === "assistant" && Array.isArray(content)) {
+					for (const b of content as Array<{ type?: string; id?: string; name?: string; arguments?: Record<string, unknown> }>) {
+						if (b?.type !== "toolCall" || !b.name || b.name === "send_user_file") continue;
+						const res = b.id ? toolResults.get(b.id) : undefined;
+						out.push({
+							kind: "tool",
+							id: b.id ?? "",
+							tool: b.name,
+							running: false,
+							err: res?.err === true,
+							args: JSON.stringify(b.arguments ?? {}).slice(0, 1200),
+							result: res?.result ?? "",
+						});
+					}
 					for (const b of content as Array<{ type?: string; name?: string; arguments?: { path?: string; caption?: string } }>) {
 						if (b?.type !== "toolCall" || b.name !== "send_user_file" || !b.arguments?.path) continue;
 						const resolved = path.isAbsolute(b.arguments.path) ? b.arguments.path : path.resolve(_cwd, b.arguments.path);
@@ -503,7 +530,9 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 			// reload/reconnect (answered synchronously by ask-user.ts).
 			const q: { pending?: Array<{ id: string; questions: unknown }> } = {};
 			_pi?.events.emit("pi-lab:ask-user-pending", q);
-			json(res, 200, { messages: out.slice(-60), pendingAsk: q.pending ?? [] });
+			// -120: tool chips count toward the window now; -60 of mixed chips
+			// + text would crowd out the conversation during tool-heavy runs.
+			json(res, 200, { messages: out.slice(-120), pendingAsk: q.pending ?? [] });
 		} catch (err) {
 			json(res, 200, { messages: [], error: String((err as Error).message ?? err) });
 		}
@@ -1284,7 +1313,12 @@ export function setupMobile(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event) => {
-		broadcast({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
+		broadcast({
+			type: "tool_start",
+			toolName: event.toolName,
+			toolCallId: event.toolCallId,
+			args: JSON.stringify(event.input ?? {}).slice(0, 1200),
+		});
 	});
 
 	pi.on("tool_result", async (event) => {

@@ -160,6 +160,12 @@ export function extractDoneSteps(message: string): number[] {
 
 export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	const doneSteps = extractDoneSteps(text);
+	// Models narrate completion more often than they emit the [DONE:n] tag
+	// ("Task 7 complete ✅ — …"). Accept the natural phrasing too so the
+	// progress bar tracks reality.
+	for (const m of text.matchAll(/(?:task|step)\s+(\d+)\s+(?:is\s+)?(?:complete|completed|done|finished)/gi)) {
+		doneSteps.push(Number.parseInt(m[1], 10));
+	}
 	for (const step of doneSteps) {
 		const item = items.find((t) => t.step === step);
 		if (item) item.completed = true;
