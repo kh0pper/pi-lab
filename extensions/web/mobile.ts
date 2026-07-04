@@ -195,8 +195,15 @@ function routeCommand(text: string, commands: SlashCommandInfo[]): {
 let _pi: ExtensionAPI | null = null;
 /** Last-seen extension context — used to report model/idle state (pi-lab fork). */
 let _lastCtx: ExtensionContext | null = null;
-/** Mirrored plan-mode state (bus: "plan-mode:state"). */
-let _planState: { enabled: boolean; executing: boolean; todosDone: number; todosTotal: number } | null = null;
+/** Mirrored plan-mode state (bus: "plan-mode:state"), incl. the step list for
+ * the PWA's tappable progress sheet. */
+let _planState: {
+	enabled: boolean;
+	executing: boolean;
+	todosDone: number;
+	todosTotal: number;
+	todos?: Array<{ step: number; text: string; completed: boolean }>;
+} | null = null;
 /** provider/id of a local model server currently being started, if any. */
 let _modelStarting: string | null = null;
 /** Mirrored permission mode (bus: "perm-mode:state"). */

@@ -295,12 +295,14 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	function announceState(): void {
-		// Web UI (mobile.ts) mirrors this into /api/mobile/status.
+		// Web UI (mobile.ts) mirrors this into /api/mobile/status; todos feed
+		// the tappable step-progress sheet in the PWA.
 		pi.events.emit("plan-mode:state", {
 			enabled: planModeEnabled,
 			executing: executionMode,
 			todosDone: todoItems.filter((t) => t.completed).length,
 			todosTotal: todoItems.length,
+			todos: todoItems.map((t) => ({ step: t.step, text: t.text, completed: t.completed })),
 		});
 	}
 

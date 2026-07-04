@@ -206,6 +206,15 @@
 		.sheet button.opt { display: block; width: 100%; text-align: left; background: var(--elevated); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px 14px; margin-bottom: 8px; color: var(--ink); font: 13px var(--mono); cursor: pointer; }
 		.sheet button.opt.hot { border-color: var(--teal); color: var(--teal); font-weight: 600; }
 		.sheet .note { color: var(--faint); font-size: 12px; margin: 4px 2px 10px; }
+		/* plan step-progress sheet */
+		.step { display: flex; gap: 9px; padding: 7px 4px; font-size: 13.5px; border-bottom: 1px solid var(--line); align-items: baseline; }
+		.step:last-of-type { border-bottom: 0; }
+		.step .sbox { font-family: var(--mono); flex-shrink: 0; color: var(--dim); }
+		.step.done { color: var(--faint); }
+		.step.done .stxt { text-decoration: line-through; }
+		.step.done .sbox { color: var(--alive); }
+		.step.cur { color: var(--teal); font-weight: 600; }
+		.step.cur .sbox { color: var(--teal); }
 	</style>
 </head>
 <body>
@@ -488,7 +497,7 @@
 							${starting ? `loading ${starting.split("/").pop()}…` : (agent.model ?? "model?").split("/").pop() + (agent.modelVision ? " 👁" : "")}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
 						</button>
-						${plan?.executing && html`<span class="chip mono">${plan.todosDone}/${plan.todosTotal} steps</span>`}
+						${plan?.executing && html`<button class="chip mono" onClick=${() => setSheet("steps")} aria-label="Show plan steps">${plan.todosDone}/${plan.todosTotal} steps</button>`}
 					</div>
 					<div class="progress ${plan?.executing && plan.todosTotal > 0 ? "show" : ""}"><div style="width:${plan?.todosTotal ? Math.round(100 * plan.todosDone / plan.todosTotal) : 0}%"></div></div>
 					<div class="banner ${attention ? "show" : ""}">⚠ Session is waiting on a terminal prompt${attention?.detail ? `: ${attention.detail}` : ""} — attach in tmux to answer.</div>
@@ -534,6 +543,17 @@
 								refreshStatus();
 							}}>${status?.agent?.classifier?.fallback === val ? "current — " : ""}${label}</button>
 						`)}
+					`}
+					${sheet === "steps" && html`
+						<h3>Plan progress — ${plan?.todosDone ?? 0}/${plan?.todosTotal ?? 0} steps</h3>
+						${(plan?.todos ?? []).map((t, i) => {
+							const curIdx = (plan.todos ?? []).findIndex((x) => !x.completed);
+							const cur = !t.completed && i === curIdx;
+							return html`<div class="step ${t.completed ? "done" : cur ? "cur" : ""}">
+								<span class="sbox">${t.completed ? "☑" : cur ? "▶" : "☐"}</span><span class="stxt">${t.step}. ${t.text}</span>
+							</div>`;
+						})}
+						${!(plan?.todos?.length) && html`<div class="note">No step list available — the plan predates step tracking, or tracking didn't engage for this run.</div>`}
 					`}
 					${sheet === "agent-model" && modelRole && html`
 						<h3>${modelRole === "executor" ? "Executor model (applied when a plan Executes)" : `Model for ${modelRole} legs`}</h3>
@@ -755,7 +775,13 @@
 						<div class="kv"><span class="k">classifier</span><span class="v" style="cursor:pointer;text-decoration:underline dotted" onClick=${() => openSheet("classifier")}>${a.classifier ? (a.classifier.dedicated ? `${a.classifier.dedicated.split(" @ ")[0]} → ${a.classifier.fallback}` : a.classifier.fallback) : "—"}</span></div>
 					</div>
 					${plan?.todosTotal > 0 && html`
-						<div class="card"><h3>Plan progress — ${plan.todosDone}/${plan.todosTotal}</h3></div>
+						<div class="card"><h3>Plan progress — ${plan.todosDone}/${plan.todosTotal}</h3>
+							${(plan.todos ?? []).map((t, i) => {
+								const curIdx = (plan.todos ?? []).findIndex((x) => !x.completed);
+								const cur = !t.completed && i === curIdx;
+								return html`<div class="step ${t.completed ? "done" : cur ? "cur" : ""}"><span class="sbox">${t.completed ? "☑" : cur ? "▶" : "☐"}</span><span class="stxt">${t.step}. ${t.text}</span></div>`;
+							})}
+						</div>
 					`}
 					<div class="card">
 						<h3>Execution models</h3>
