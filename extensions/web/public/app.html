@@ -376,6 +376,10 @@
 						if (d.type === "perm_mode") { setPermMode(d.mode); }
 						if (d.type === "attention") { setAttention(d); }
 						if (d.type === "attention_clear") { setAttention(null); }
+						if (d.type === "compaction") {
+							addMsg({ kind: "sys", text: d.state === "start" ? "⏳ compacting context — this takes a few minutes…" : `✓ context compacted${d.tokensBefore ? ` (was ${Math.round(d.tokensBefore / 1000)}k tokens)` : ""}` });
+							if (d.state === "done") refreshStatus();
+						}
 						if (d.type === "user_file") addMsg({ kind: "file", id: d.id, name: d.name, mime: d.mime, size: d.size, caption: d.caption });
 						if (d.type === "ask_user") setMsgs((p) => p.some((m) => m.kind === "ask" && m.id === d.id) ? p : [...p.slice(-199), { kind: "ask", id: d.id, questions: d.questions }]);
 						if (d.type === "ask_user_resolved") setMsgs((p) => p.map((m) => m.kind === "ask" && m.id === d.id ? { ...m, done: true } : m));

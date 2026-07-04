@@ -477,6 +477,12 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 					out.push({ kind: "sys", text: `now on ${mc.provider}/${mc.modelId}` });
 					continue;
 				}
+				const cp = e as { type: string; tokensBefore?: unknown };
+				if (cp.type === "compaction") {
+					const before = Number(cp.tokensBefore ?? 0);
+					out.push({ kind: "sys", text: `— context compacted${before ? ` (was ${Math.round(before / 1000)}k tokens)` : ""} —` });
+					continue;
+				}
 				// Answered bus-only cards (permission / plan-next / critique) —
 				// persisted by shared/remote-ask.ts + plan-mode as custom entries.
 				const ce = e as { type: string; customType?: string; data?: { question?: string; header?: string; options?: unknown; answer?: string } };
@@ -1267,6 +1273,18 @@ export function setupMobile(pi: ExtensionAPI) {
 	pi.events.on("perm-mode:state", (data) => {
 		_permMode = (data as { mode?: string })?.mode ?? null;
 		broadcast({ type: "perm_mode", mode: _permMode, time: new Date().toISOString() });
+	});
+
+	// Compaction visibility (phone-driven sessions otherwise just look
+	// mysteriously busy for minutes): start + done cues, and the context
+	// meter refreshes via the client's status reload on "done".
+	pi.on("session_before_compact", async () => {
+		broadcast({ type: "compaction", state: "start", time: new Date().toISOString() });
+	});
+	pi.on("session_compact", async (event, ctx) => {
+		_lastCtx = ctx;
+		const before = Number((event as { compactionEntry?: { tokensBefore?: unknown } }).compactionEntry?.tokensBefore ?? 0);
+		broadcast({ type: "compaction", state: "done", tokensBefore: before || undefined, time: new Date().toISOString() });
 	});
 
 	// ask_user tool (ask-user.ts) — forward question cards and their
