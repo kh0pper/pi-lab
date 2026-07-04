@@ -33,6 +33,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { raceWithPhone } from "../shared/remote-ask.js";
 import { discoverAgents } from "../subagent/agents.js";
 import { getFinalOutput, runSingleAgent, type SingleResult, type SubagentDetails } from "../subagent/run.js";
 
@@ -418,13 +419,26 @@ export default function (pi: ExtensionAPI) {
 			pi.events.emit("pi-lab:critique-verdict", busPayload);
 
 			if (!allPassed && ctx.hasUI && !busPayload.handled) {
-				// The confirm renders in the terminal — ping remote watchers so a
-				// phone user knows why the session went quiet.
-				pi.events.emit("pi-lab:attention", { reason: "critique", detail: "critics found blocking issues — confirm in terminal or reply here" });
-				const send = await ctx.ui.confirm(
-					"Critics found blocking issues",
-					"Send the findings to the agent to address?",
+				// Terminal confirm races a phone-answerable card (ask_user bus) —
+				// auto-critique fires unattended after plan execution, so this
+				// prompt is MOST often hit with nobody at the terminal.
+				pi.events.emit("pi-lab:attention", { reason: "critique", detail: "critics found blocking issues" });
+				const picked = await raceWithPhone(
+					pi,
+					{
+						question: "Critics found blocking issues in the diff — send the findings to the agent to address?",
+						header: "Critique",
+						options: [
+							{ label: "Send findings", description: "The agent gets the blockers and fixes them" },
+							{ label: "Ignore", description: "Leave the diff as-is" },
+						],
+					},
+					async (signal) =>
+						(await ctx.ui.confirm("Critics found blocking issues", "Send the findings to the agent to address?", { signal }))
+							? "Send findings"
+							: "Ignore",
 				);
+				const send = picked === "Send findings";
 				row.userSentFindings = send;
 				if (send) {
 					const findingsText = verdicts

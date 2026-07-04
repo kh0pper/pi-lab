@@ -208,6 +208,8 @@ let _planState: {
 let _modelStarting: string | null = null;
 /** Mirrored permission mode (bus: "perm-mode:state"). */
 let _permMode: string | null = null;
+/** Live blocking-prompt state (bus: "pi-lab:attention") — survives reconnects via /status. */
+let _attention: { reason: string; detail: string; time: string } | null = null;
 
 /** Files the agent sent to the user via the send_user_file tool: id → meta. */
 const _sentFiles = new Map<string, { path: string; name: string; mime: string; size: number }>();
@@ -943,6 +945,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 				contextWindow,
 				planMode: _planState,
 				permMode: _permMode,
+				attention: _attention,
 				cwd: _cwd,
 				sessionId,
 				sessionName,
@@ -1215,10 +1218,24 @@ export function setupMobile(pi: ExtensionAPI) {
 
 	// Surface blocking terminal prompts (permission-gating) to web clients —
 	// otherwise the session just looks mysteriously quiet from the phone.
+	// State is MIRRORED (not just broadcast) so a phone that reconnects while
+	// the prompt is still up sees the banner via /status instead of nothing.
 	pi.events.on("pi-lab:attention", (data) => {
 		const d = (data ?? {}) as { reason?: string; detail?: string };
-		broadcast({ type: "attention", reason: d.reason ?? "attention", detail: d.detail ?? "", time: new Date().toISOString() });
+		_attention = { reason: d.reason ?? "attention", detail: d.detail ?? "", time: new Date().toISOString() };
+		broadcast({ type: "attention", ..._attention });
 	});
+	// Prompt resolution paths: permission prompts settle through the ask-user
+	// bus now; any tool result / turn boundary also means the dialog is gone.
+	const clearAttention = () => {
+		if (_attention) {
+			_attention = null;
+			broadcast({ type: "attention_clear", time: new Date().toISOString() });
+		}
+	};
+	pi.events.on("pi-lab:ask-user-resolved", clearAttention);
+	pi.on("tool_result", async () => clearAttention());
+	pi.on("agent_end", async () => clearAttention());
 
 	// Keep the context fresh so /status reports the CURRENT model (pickers and
 	// /agent-models can switch it mid-session).

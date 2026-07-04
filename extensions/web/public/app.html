@@ -320,7 +320,7 @@
 			const msgsRef = useRef(null);
 
 			const addMsg = useCallback((m) => setMsgs((p) => [...p.slice(-199), m]), []);
-			const refreshStatus = useCallback(() => { api("/status").then((s) => { if (!s.error) { setStatus(s); setPlan(s.agent?.planMode ?? null); setPermMode(s.agent?.permMode ?? null); } }); }, []);
+			const refreshStatus = useCallback(() => { api("/status").then((s) => { if (!s.error) { setStatus(s); setPlan(s.agent?.planMode ?? null); setPermMode(s.agent?.permMode ?? null); setAttention(s.agent?.attention ?? null); } }); }, []);
 
 			const loadHistory = useCallback(async () => {
 				const h = await api("/chat/history");
@@ -365,6 +365,7 @@
 						if (d.type === "plan_state") { setPlan(d); }
 						if (d.type === "perm_mode") { setPermMode(d.mode); }
 						if (d.type === "attention") { setAttention(d); }
+						if (d.type === "attention_clear") { setAttention(null); }
 						if (d.type === "user_file") addMsg({ kind: "file", id: d.id, name: d.name, mime: d.mime, size: d.size, caption: d.caption });
 						if (d.type === "ask_user") setMsgs((p) => p.some((m) => m.kind === "ask" && m.id === d.id) ? p : [...p.slice(-199), { kind: "ask", id: d.id, questions: d.questions }]);
 						if (d.type === "ask_user_resolved") setMsgs((p) => p.map((m) => m.kind === "ask" && m.id === d.id ? { ...m, done: true } : m));
@@ -500,7 +501,7 @@
 						${plan?.executing && html`<button class="chip mono" onClick=${() => setSheet("steps")} aria-label="Show plan steps">${plan.todosDone}/${plan.todosTotal} steps</button>`}
 					</div>
 					<div class="progress ${plan?.executing && plan.todosTotal > 0 ? "show" : ""}"><div style="width:${plan?.todosTotal ? Math.round(100 * plan.todosDone / plan.todosTotal) : 0}%"></div></div>
-					<div class="banner ${attention ? "show" : ""}">⚠ Session is waiting on a terminal prompt${attention?.detail ? `: ${attention.detail}` : ""} — attach in tmux to answer.</div>
+					<div class="banner ${attention ? "show" : ""}">⚠ Session is waiting on a prompt${attention?.detail ? `: ${attention.detail}` : ""} — answer the question card in the chat.</div>
 				</header>
 
 				<div class="content">

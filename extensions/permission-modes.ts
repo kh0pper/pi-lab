@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { isSafeCommand } from "./plan-mode/utils.js";
+import { raceWithPhone } from "./shared/remote-ask.js";
 
 type Mode = "ask" | "accept-edits" | "auto" | "bypass";
 const MODES: Mode[] = ["ask", "accept-edits", "auto", "bypass"];
@@ -309,7 +310,20 @@ export default function (pi: ExtensionAPI) {
 		if (prior === "deny") return { block: true, reason: `Denied earlier this session: ${key}` };
 		if (!ctx.hasUI) return { block: true, reason: `Blocked (${mode} mode, no UI to confirm): ${key}` };
 		pi.events.emit("pi-lab:attention", { reason: "permission", detail: title });
-		const choice = await ctx.ui.select(`${title}\n${detail}`, ["Allow once", "Allow for this session", "Deny"]);
+		// Terminal selector races a phone-answerable card (ask_user bus) —
+		// first explicit answer wins; dismissal stays fail-closed (deny).
+		const choice = await raceWithPhone(
+			pi,
+			{
+				question: `${title} — ${detail}`,
+				options: [
+					{ label: "Allow once", description: "Run this one; ask again next time" },
+					{ label: "Allow for this session", description: "Stop asking about this for the session" },
+					{ label: "Deny", description: "Block it (remembered for the session)" },
+				],
+			},
+			(signal) => ctx.ui.select(`${title}\n${detail}`, ["Allow once", "Allow for this session", "Deny"], { signal }),
+		);
 		if (choice === "Allow for this session") {
 			remembered.set(key, "allow");
 			return undefined;

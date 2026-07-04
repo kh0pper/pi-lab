@@ -20,6 +20,10 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { resolve } from "node:path";
+import { raceWithPhone } from "./shared/remote-ask.js";
+
+const APPROVE = "Approve for this session";
+const BLOCK = "Block";
 
 // ---------------------------------------------------------------------------
 // Per-bot policy gate (Crow Bot Builder Phase 2.2)
@@ -278,11 +282,28 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Interactive prompt imminent — let notify.ts ping the user's phone.
+			// The prompt itself races the terminal dialog against a phone card
+			// (ask_user bus) — answerable from either; fail-closed on dismissal.
 			pi.events.emit("pi-lab:attention", { reason: "permission", detail: matched });
-			const choice = await ctx.ui.confirm(
-				`⚠️ Destructive bash: ${matched}`,
-				`"${truncateForPreview(command, 4)}"\n\nApprove for the rest of this session, or block?`,
+			const picked = await raceWithPhone(
+				pi,
+				{
+					question: `Destructive bash flagged: ${matched} — "${truncateForPreview(command, 4)}"`,
+					options: [
+						{ label: APPROVE, description: "Run it, and allow this pattern for the rest of the session" },
+						{ label: BLOCK, description: "Refuse it (remembered for the session)" },
+					],
+				},
+				async (signal) =>
+					(await ctx.ui.confirm(
+						`⚠️ Destructive bash: ${matched}`,
+						`"${truncateForPreview(command, 4)}"\n\nApprove for the rest of this session, or block?`,
+						{ signal },
+					))
+						? APPROVE
+						: BLOCK,
 			);
+			const choice = picked === APPROVE;
 			remembered.set(memKey, choice ? "allow" : "block");
 			return choice ? undefined : { block: true, reason: `Blocked by user: ${matched}` };
 		}
@@ -304,10 +325,25 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			pi.events.emit("pi-lab:attention", { reason: "permission", detail: `write ${path}` });
-			const choice = await ctx.ui.confirm(
-				`Write to ${matched}: ${path}`,
-				`Overwriting sensitive path.\n\nContent preview:\n${truncateForPreview(content, 8)}\n\nApprove for the rest of this session, or block?`,
+			const picked = await raceWithPhone(
+				pi,
+				{
+					question: `Write to sensitive path (${matched}): ${path}`,
+					options: [
+						{ label: APPROVE, description: `Preview: ${truncateForPreview(content, 3)}` },
+						{ label: BLOCK, description: "Refuse the write (remembered for the session)" },
+					],
+				},
+				async (signal) =>
+					(await ctx.ui.confirm(
+						`Write to ${matched}: ${path}`,
+						`Overwriting sensitive path.\n\nContent preview:\n${truncateForPreview(content, 8)}\n\nApprove for the rest of this session, or block?`,
+						{ signal },
+					))
+						? APPROVE
+						: BLOCK,
 			);
+			const choice = picked === APPROVE;
 			remembered.set(memKey, choice ? "allow" : "block");
 			return choice ? undefined : { block: true, reason: "Blocked by user" };
 		}
@@ -329,10 +365,25 @@ export default function (pi: ExtensionAPI) {
 
 			pi.events.emit("pi-lab:attention", { reason: "permission", detail: `edit ${path}` });
 			const edits = (event.input as { edits?: Array<{ oldText: string; newText: string }> }).edits ?? [];
-			const choice = await ctx.ui.confirm(
-				`Edit ${matched}: ${path}`,
-				`Editing sensitive path (${edits.length} replacement${edits.length === 1 ? "" : "s"}).\n\nApprove for the rest of this session, or block?`,
+			const picked = await raceWithPhone(
+				pi,
+				{
+					question: `Edit sensitive path (${matched}): ${path} — ${edits.length} replacement${edits.length === 1 ? "" : "s"}`,
+					options: [
+						{ label: APPROVE, description: "Apply the edit, allow this path for the session" },
+						{ label: BLOCK, description: "Refuse the edit (remembered for the session)" },
+					],
+				},
+				async (signal) =>
+					(await ctx.ui.confirm(
+						`Edit ${matched}: ${path}`,
+						`Editing sensitive path (${edits.length} replacement${edits.length === 1 ? "" : "s"}).\n\nApprove for the rest of this session, or block?`,
+						{ signal },
+					))
+						? APPROVE
+						: BLOCK,
 			);
+			const choice = picked === APPROVE;
 			remembered.set(memKey, choice ? "allow" : "block");
 			return choice ? undefined : { block: true, reason: "Blocked by user" };
 		}

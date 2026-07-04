@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { appendCritiqueTelemetry, critiqueArtifact, type CritiqueTelemetryRow } from "./critic/index.js";
+import { raceWithPhone } from "./shared/remote-ask.js";
 import { discoverAgents } from "./subagent/agents.js";
 import { getFinalOutput, runSingleAgent, type SingleResult, type SubagentDetails } from "./subagent/run.js";
 
@@ -255,10 +256,26 @@ export default function (pi: ExtensionAPI) {
 				toast("tournament refused: background tasks are running", "warning");
 				return;
 			}
-			const kill = await ctx.ui.confirm(
-				"Background tasks are running",
-				`${bg.running!.length} task(s) would corrupt every attempt's diff. Kill them and continue?`,
-			);
+			const kill =
+				(await raceWithPhone(
+					pi,
+					{
+						question: `Tournament: ${bg.running!.length} background task(s) would corrupt every attempt's diff. Kill them and continue?`,
+						header: "Tournament",
+						options: [
+							{ label: "Kill and continue", description: "Stop the background tasks, run the tournament" },
+							{ label: "Abort tournament", description: "Leave background tasks running" },
+						],
+					},
+					async (signal) =>
+						(await ctx.ui.confirm(
+							"Background tasks are running",
+							`${bg.running!.length} task(s) would corrupt every attempt's diff. Kill them and continue?`,
+							{ signal },
+						))
+							? "Kill and continue"
+							: "Abort tournament",
+				)) === "Kill and continue";
 			if (!kill) return;
 			pi.events.emit("pi-lab:bg-kill-all", {});
 		}
@@ -355,11 +372,27 @@ export default function (pi: ExtensionAPI) {
 			const winner = scored[0];
 
 			if (winner.passCount === 0 && ctx.hasUI) {
-				pi.events.emit("pi-lab:attention", { reason: "tournament", detail: "no attempt passed critics — confirm apply in terminal" });
-				const apply = await ctx.ui.confirm(
-					"Tournament: no attempt passed critics",
-					`Apply the least-bad attempt (#${winner.index}: ${winner.blockers} blockers, ${winner.warns} warns) anyway? One /rewind undoes it.`,
-				);
+				pi.events.emit("pi-lab:attention", { reason: "tournament", detail: "no attempt passed critics" });
+				const apply =
+					(await raceWithPhone(
+						pi,
+						{
+							question: `Tournament: no attempt passed critics. Apply the least-bad attempt anyway (#${winner.index}: ${winner.blockers} blockers, ${winner.warns} warns)? One /rewind undoes it.`,
+							header: "Tournament",
+							options: [
+								{ label: "Apply anyway", description: "Take the least-bad diff; /rewind undoes it" },
+								{ label: "Keep baseline", description: "Discard all attempts" },
+							],
+						},
+						async (signal) =>
+							(await ctx.ui.confirm(
+								"Tournament: no attempt passed critics",
+								`Apply the least-bad attempt (#${winner.index}: ${winner.blockers} blockers, ${winner.warns} warns) anyway? One /rewind undoes it.`,
+								{ signal },
+							))
+								? "Apply anyway"
+								: "Keep baseline",
+					)) === "Apply anyway";
 				if (!apply) {
 					progress(ctx, "declined — baseline kept");
 					summarize(attempts, null, task, tournamentId);
@@ -380,10 +413,26 @@ export default function (pi: ExtensionAPI) {
 			if (!applied.ok) {
 				progress(ctx, `winner patch failed to apply (${applied.stderr.slice(0, 120)})`, );
 				if (ctx.hasUI) {
-					const hard = await ctx.ui.confirm(
-						"Tournament: patch apply failed",
-						`Reset the work tree to the winning attempt's snapshot instead? (attempt #${winner.index}, recoverable via refs/checkpoints)`,
-					);
+					const hard =
+						(await raceWithPhone(
+							pi,
+							{
+								question: `Tournament: the winning patch failed to apply. Hard-reset the work tree to attempt #${winner.index}'s snapshot instead? (recoverable via refs/checkpoints)`,
+								header: "Tournament",
+								options: [
+									{ label: "Reset to snapshot", description: "Work tree becomes the winning attempt; checkpoints restore" },
+									{ label: "Keep current tree", description: "Leave everything as-is" },
+								],
+							},
+							async (signal) =>
+								(await ctx.ui.confirm(
+									"Tournament: patch apply failed",
+									`Reset the work tree to the winning attempt's snapshot instead? (attempt #${winner.index}, recoverable via refs/checkpoints)`,
+									{ signal },
+								))
+									? "Reset to snapshot"
+									: "Keep current tree",
+						)) === "Reset to snapshot";
 					if (hard) {
 						const q: { sha: string; internal: boolean; promise?: Promise<{ safetySha: string }> } = { sha: winner.sha!, internal: true };
 						pi.events.emit("pi-lab:checkpoint-restore", q);

@@ -20,6 +20,7 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
+import { raceWithPhone } from "../shared/remote-ask.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import {
 	getFinalOutput,
@@ -381,10 +382,28 @@ export default function (pi: ExtensionAPI) {
 				if (projectAgentsRequested.length > 0) {
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+					// Mid-run prompt — race the terminal confirm with a phone card
+					// so a remote session doesn't block invisibly. Fail-closed.
+					const picked = await raceWithPhone(
+						pi,
+						{
+							question: `Run project-local agents (${names}) from ${dir}? Project agents are repo-controlled — only approve for trusted repositories.`,
+							header: "Agents",
+							options: [
+								{ label: "Run them", description: "Trust this repository's agent definitions" },
+								{ label: "Cancel", description: "Refuse repo-controlled agents" },
+							],
+						},
+						async (signal) =>
+							(await ctx.ui.confirm(
+								"Run project-local agents?",
+								`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+								{ signal },
+							))
+								? "Run them"
+								: "Cancel",
 					);
+					const ok = picked === "Run them";
 					if (!ok)
 						return {
 							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
