@@ -58,10 +58,21 @@ export function raceWithPhone(
 	void runTui(tuiAbort.signal)
 		.then((c) => settle(c))
 		.catch(() => settle(undefined));
-	return done.finally(() => {
+	return done.then((choice) => {
 		tuiAbort.abort();
 		offAnswer();
 		offPending();
 		pi.events.emit("pi-lab:ask-user-resolved", { id: qid, answered: true });
+		// Persist the exchange (not sent to the LLM) so the answered card
+		// survives reloads — bus-only prompts otherwise leave no trace in
+		// the session at all.
+		if (choice !== undefined) {
+			try {
+				pi.appendEntry("pi-lab-remote-ask", { question: q.question, header: q.header ?? "Permission", options: q.options, answer: choice });
+			} catch {
+				// persistence is best-effort
+			}
+		}
+		return choice;
 	});
 }

@@ -467,6 +467,29 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 					if (t) out.push({ kind: "user", text: t });
 					continue;
 				}
+				// System notes persist too: command results and model switches.
+				if (e.type === "custom_message" && e.customType === "command_result" && typeof e.content === "string") {
+					if (e.content.trim()) out.push({ kind: "sys", text: e.content.trim().slice(0, 300) });
+					continue;
+				}
+				const mc = e as { type: string; provider?: string; modelId?: string };
+				if (mc.type === "model_change" && mc.provider && mc.modelId) {
+					out.push({ kind: "sys", text: `now on ${mc.provider}/${mc.modelId}` });
+					continue;
+				}
+				// Answered bus-only cards (permission / plan-next / critique) —
+				// persisted by shared/remote-ask.ts + plan-mode as custom entries.
+				const ce = e as { type: string; customType?: string; data?: { question?: string; header?: string; options?: unknown; answer?: string } };
+				if (ce.type === "custom" && ce.customType === "pi-lab-remote-ask" && ce.data?.question) {
+					out.push({
+						kind: "ask",
+						id: "",
+						done: true,
+						questions: [{ question: ce.data.question, header: ce.data.header, options: ce.data.options ?? [] }],
+						answerText: ce.data.answer ?? "",
+					});
+					continue;
+				}
 				if (e.type !== "message" || !e.message) continue;
 				const { role, content } = e.message;
 				let text = "";
@@ -492,6 +515,18 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 					for (const b of content as Array<{ type?: string; id?: string; name?: string; arguments?: Record<string, unknown> }>) {
 						if (b?.type !== "toolCall" || !b.name || b.name === "send_user_file") continue;
 						const res = b.id ? toolResults.get(b.id) : undefined;
+						// ask_user calls restore as ANSWERED question cards, not
+						// chips — the result text carries the Q/A exchange.
+						if (b.name === "ask_user") {
+							out.push({
+								kind: "ask",
+								id: b.id ?? "",
+								done: true,
+								questions: (b.arguments as { questions?: unknown })?.questions ?? [],
+								answerText: res?.result ?? "",
+							});
+							continue;
+						}
 						out.push({
 							kind: "tool",
 							id: b.id ?? "",

@@ -129,6 +129,7 @@
 		.ask-send { width: 100%; margin-top: 4px; border: 0; border-radius: var(--r-sm); background: var(--teal); color: #fff; padding: 10px; font: 600 13.5px var(--sans); cursor: pointer; }
 		.ask-send:disabled { opacity: .45; }
 		.ask-done { color: var(--alive); font-size: 12.5px; font-weight: 600; }
+		.ask-answer { color: var(--dim); font: 400 12px var(--mono); margin-top: 4px; white-space: pre-wrap; }
 
 		/* composer */
 		.attach-chips { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 12px 0; background: var(--card); }
@@ -629,7 +630,7 @@
 						onInput=${(e) => setOther((p) => p.map((v, i) => i === qi ? e.target.value : v))} />
 				</div>`)}
 				${done
-					? html`<div class="ask-done">✓ answered</div>`
+					? html`<div class="ask-done">✓ answered${m.answerText ? html`<div class="ask-answer">${m.answerText}</div>` : null}</div>`
 					: html`<button class="ask-send" disabled=${!ready || sending} onClick=${submit}>${sending ? "sending…" : qs.length > 1 ? "Send answers" : "Send answer"}</button>`}
 			</div>`;
 		}

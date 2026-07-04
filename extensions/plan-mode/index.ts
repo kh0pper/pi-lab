@@ -714,6 +714,12 @@ ${todoList}`,
 		offPending();
 		offPrompt();
 		pi.events.emit("pi-lab:ask-user-resolved", { id: qid, answered: true });
+		try {
+			// Answered card survives reloads (rendered from this entry).
+			pi.appendEntry("pi-lab-remote-ask", { question: questions[0].question, header: "Plan", options: questions[0].options, answer: choice });
+		} catch {
+			// best-effort
+		}
 
 		if (choice.startsWith("Execute")) {
 			planModeEnabled = false;
