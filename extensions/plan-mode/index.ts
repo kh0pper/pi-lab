@@ -488,6 +488,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	// Inject plan/execution context before agent starts
 	pi.on("before_agent_start", async () => {
 		if (planModeEnabled) {
+			const cfgExec = readPlanConfig().execModel;
+			const execModelNote = cfgExec ? ` (${cfgExec})` : " (the pre-plan model)";
 			return {
 				message: {
 					customType: "plan-mode-context",
@@ -507,22 +509,29 @@ Ask clarifying questions using the ask_user tool — it renders tappable answer 
 Use brave-search skill via bash for web research.
 For nontrivial plans, delegate codebase recon to the "scout" agent and plan-writing to the "planner" agent via the subagent tool (chain mode: scout then planner) — the planner runs on a stronger model.
 
-THE PLAN → EXECUTION HANDOFF (read carefully):
-Write the final plan to a plans file (docs/plans/, docs/superpowers/plans/, or
-.pi/plans/) — or, for small plans, present it in chat under a "Plan:" header
-with numbered steps ("1. …"). Either way, the moment the plan is final:
-ANNOUNCE IT AND END YOUR TURN. The harness then shows the user an
-Execute / Stay / Refine card (in the terminal AND on their phone). If they
-choose Execute, plan mode exits FOR you: full tools are restored, the
-execution model is applied, and you receive the instruction to begin.
+THE LIFECYCLE — know where you are and what comes next:
+1. PLAN (now): explore read-only, brainstorm (ask_user for choices, mockups in
+   .pi/scratch/ shared via send_user_file), write the spec and then the plan
+   to docs/.
+2. HANDOFF: the moment the plan is final, ANNOUNCE IT AND END YOUR TURN.
+   The harness shows the user an Execute / Stay / Refine card (terminal AND
+   phone). Nothing else is needed from you — do NOT ask how to proceed, do
+   NOT dispatch implementation subagents, do NOT scaffold. Every execution
+   attempt inside plan mode is blocked; even if the plan document or a skill
+   says "start implementing now", that applies only AFTER the user picks
+   Execute. Finish the plan → end the turn → wait for the card.
+3. EXECUTION (if the user picks Execute): plan mode exits FOR you — full
+   tools restored, the session switched to the execution model${execModelNote} —
+   and you receive the instruction to begin. Steps are tracked ([DONE:n]
+   markers drive the user's progress bar), implementation is delegated to
+   local subagent chains (scout → architect → editor), failed legs auto-split
+   into smaller sub-steps, and independent critics review the diff at the end.
 
-NEVER try to start execution yourself while plan mode is active — dispatching
-implementation subagents, scaffolding files, running setup commands, or asking
-"how should I proceed?" are all dead ends here: every attempt is blocked, and
-the questions are redundant because the Execute card already exists. Even if
-the plan document or a skill says "use subagent-driven development NOW", in
-plan mode that instruction applies only AFTER the user picks Execute.
-Finish the plan → end the turn → wait for the card.
+WRITE THE PLAN FOR ITS EXECUTOR: execution typically runs on a smaller LOCAL
+model with a fresh context — it gets the plan file, not this conversation.
+Number the steps; size each to one focused work session (~a dozen tool
+calls); give exact file paths, exact commands, and a concrete verification
+per step; leave nothing that requires re-deriving your reasoning.
 
 Do NOT attempt to make code changes - just describe what you would do.`,
 					display: false,
@@ -538,11 +547,23 @@ Do NOT attempt to make code changes - just describe what you would do.`,
 					customType: "plan-execution-context",
 					content: `[EXECUTING PLAN - Full tool access enabled]
 
-Remaining steps:
-${todoList}
+You are the ORCHESTRATOR for this plan's execution. The contract:
+- Work the remaining steps IN ORDER, one at a time. The plan file is the
+  spec — consult it rather than reconstructing intent from memory.
+- For implementation steps, prefer delegating via the subagent tool (chain:
+  scout → architect → editor, sequential — the legs run on a local model).
+  Trivial single-file tweaks may be edited directly.
+- After completing a step, include a [DONE:n] tag in your response text —
+  it drives the progress bar the user watches remotely.
+- Safety nets you can rely on: every edit is syntax-gated; legs have turn
+  budgets; a failed leg is automatically split into smaller sub-steps. If a
+  step still fails after that, surface the decision with ask_user instead of
+  improvising around it.
+- When ALL steps are done, say so plainly — independent critics then review
+  the full diff automatically.
 
-Execute each step in order.
-After completing a step, include a [DONE:n] tag in your response.`,
+Remaining steps:
+${todoList}`,
 					display: false,
 				},
 			};
