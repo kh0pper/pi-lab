@@ -22,20 +22,76 @@ for f in "$PI_SKILLS"/crow-*.md "$PI_SKILLS"/_plugin-*; do
   [ -L "$f" ] && rm -f "$f"
 done
 
+# Hidden skills (settings.json skillsPrune.hide): still installed and manually
+# loadable, but their SKILL.md is materialized as a COPY with
+# `disable-model-invocation: true` injected, so pi's skill loader keeps them
+# out of the system prompt (~100 tokens each). Copies rather than source edits
+# because SKILL.md sources live in the Claude plugin marketplace cache / crow
+# repo — editing them would leak the flag into Claude Code and be overwritten
+# by plugin updates. Copies refresh on every bridge run.
+HIDDEN_SKILLS=$(python3 -c "
+import json, os
+try:
+    s = json.load(open(os.path.expanduser('~/.pi/agent/settings.json')))
+    print(' '.join(s.get('skillsPrune', {}).get('hide', [])))
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+is_hidden_skill() {
+  local n=$1 h
+  for h in $HIDDEN_SKILLS; do [ "$h" = "$n" ] && return 0; done
+  return 1
+}
+
+# Copy a SKILL.md with disable-model-invocation: true injected into frontmatter.
+copy_skill_md_hidden() {
+  local src=$1 dst=$2
+  awk 'NR==1 && /^---$/ { print; print "disable-model-invocation: true"; next }
+       /^disable-model-invocation:/ { next }
+       { print }' "$src" > "$dst"
+}
+
 # Helper: link a SKILL.md as a frontmatter-named wrapper dir, with first-wins collision handling.
 # Args: <skill_md_path> <fallback_name> <link_target_kind> <accumulator_prefix>
 #   link_target_kind: "dir" (symlink the whole containing directory) or "file" (mkdir + symlink SKILL.md only)
 # Side effects: increments _linked / _skipped / _collisions counters in the caller's scope.
+# Hidden skills are handled in both modes: real dir, flagged SKILL.md copy,
+# symlinks for any supporting files.
 link_skill() {
   local skill_md=$1 fallback_name=$2 link_kind=$3
   # Require description: field (pi rejects skills without it)
   if ! awk '/^---$/{c++; next} c==1 && /^description:/{found=1} END{exit !found}' "$skill_md"; then
     _skipped=$((_skipped+1)); return
   fi
-  local fm_name name target src current
+  local fm_name name target src current f
   fm_name=$(awk '/^---$/{c++; next} c==1 && /^name:/{sub(/^name:[[:space:]]*/,""); print; exit}' "$skill_md")
   name=${fm_name:-$fallback_name}
   target="$PI_SKILLS/$name"
+
+  if is_hidden_skill "$name"; then
+    # Rebuild the hidden wrapper from scratch each run (fresh copy of the flag).
+    src=$(dirname "$skill_md")
+    rm -rf "$target"
+    mkdir -p "$target"
+    copy_skill_md_hidden "$skill_md" "$target/SKILL.md"
+    if [ "$link_kind" = "dir" ]; then
+      for f in "$src"/* "$src"/.[!.]*; do
+        [ -e "$f" ] || continue
+        [ "$(basename "$f")" = "SKILL.md" ] && continue
+        ln -sfn "$f" "$target/$(basename "$f")"
+      done
+    fi
+    _linked=$((_linked+1))
+    return
+  fi
+  # A previous run may have materialized this skill as hidden — clear the
+  # real-dir wrapper so the plain symlink path below can recreate it.
+  if [ ! -L "$target" ] && [ -f "$target/SKILL.md" ] && [ ! -L "$target/SKILL.md" ] \
+     && grep -q '^disable-model-invocation: true' "$target/SKILL.md" 2>/dev/null; then
+    rm -rf "$target"
+  fi
+
   if [ "$link_kind" = "dir" ]; then
     src=$(dirname "$skill_md")
     if [ -L "$target" ]; then

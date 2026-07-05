@@ -236,7 +236,7 @@
 		const APP_BASE = location.pathname.replace(/\/mobile(\/.*)?$/, "");
 		// Client build marker — sent on history/events requests so the server
 		// access log shows which shell version a phone is actually running.
-		const CLIENT_BUILD = "w1";
+		const CLIENT_BUILD = "w3";
 		const api = (p, opts) => fetch(APP_BASE + "/api/mobile" + p + (p.includes("?") ? "&" : "?") + "b=" + CLIENT_BUILD, opts).then(r => r.json()).catch(() => ({ error: "network" }));
 		const post = (p, body) => api(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 		const sendPrompt = (prompt) => post("/chat/prompt", { prompt });
@@ -769,7 +769,27 @@
 		}
 
 		function Session({ status, plan, refresh, send, openSheet, em, pickRole, loadEm }) {
-			useEffect(() => { refresh(); loadEm(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
+			const [mcp, setMcp] = useState(null);
+			const loadMcp = useCallback(() => api("/mcp").then((r) => { if (!r.error) setMcp(r); }), []);
+			useEffect(() => { refresh(); loadEm(); loadMcp(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
+			// Toggle a server for THIS project: persists a flag-only entry to
+			// <cwd>/.mcp.json AND applies live (connect/disconnect + active-tool
+			// swap) in the running session. Live apply can fail (e.g. plan mode)
+			// — the file change still stands for the next session.
+			const mcpDone = (r) => {
+				if (r?.error) { alert(r.error); return; }
+				if (r?.liveError) alert("Saved for next session. Live apply: " + r.liveError);
+				loadMcp(); refresh();
+			};
+			const mcpToggle = async (s) => {
+				const patch = s.optIn
+					? (s.active ? { enabled: null } : { enabled: true })
+					: (s.active ? { disabled: true } : { disabled: null });
+				mcpDone(await post("/mcp", { server: s.name, patch }));
+			};
+			const mcpRouter = async (s) => {
+				mcpDone(await post("/mcp", { server: s.name, patch: { router: !s.routed } }));
+			};
 			const a = status?.agent ?? {}; const s = status?.system ?? {};
 			const dot = (m) => { const d = (em?.bound ?? []).find((x) => x.ref === m); return d?.local ? (d.running ? "● " : "○ ") : ""; };
 			const short = (m) => m ? m.split("/").pop() : null;
@@ -816,6 +836,29 @@
 							<div class="kv"><span class="k">${ag.name}${ag.override ? " *" : ""}</span><span class="v" style="cursor:pointer;text-decoration:underline dotted" onClick=${() => pickRole(ag.name)}>${ag.model ? dot(ag.model) + short(ag.model) : "inherit session"}</span></div>`)}
 						<div class="note" style="margin:8px 2px 2px;color:var(--faint);font-size:11.5px">tap to re-bind · * = settings override · ●/○ local run state · legs apply on next spawn, executor at Execute</div>
 					</div>
+					${mcp?.servers?.length > 0 && html`
+						<div class="card">
+							<h3>MCP servers</h3>
+							${mcp.servers.map((s) => {
+								const pending = s.active !== s.loadedNow;
+								const state = s.active ? (s.loadedNow && !s.healthy ? "on (unhealthy)" : "on") : (s.optIn ? "opt-in off" : "off");
+								return html`
+									<div class="kv">
+										<span class="k">${s.name}${s.loadedNow && s.toolCount ? ` (${s.toolCount})` : ""}</span>
+										<span class="v">
+											${s.projectDefined
+												? html`<span style="color:var(--faint)">project-defined</span>`
+												: html`
+													<span style="cursor:pointer;text-decoration:underline dotted;color:${s.active ? "inherit" : "var(--faint)"}" onClick=${() => mcpToggle(s)}>${state}</span>
+													<span style="cursor:pointer;margin-left:10px;font-size:11px;padding:1px 6px;border-radius:8px;border:1px solid var(--line);color:${s.routed ? "var(--teal)" : "var(--faint)"}" onClick=${() => mcpRouter(s)}>router</span>
+												`}
+											${pending ? html`<span style="margin-left:8px;color:var(--amber,orange);font-size:11px">→ next session</span>` : ""}
+										</span>
+									</div>`;
+							})}
+							<div class="note" style="margin:8px 2px 2px;color:var(--faint);font-size:11.5px">tap state to toggle — applies to this session immediately and persists for this folder (.mcp.json) · router = one gateway tool instead of every schema · "→ next session" = live apply pending a restart</div>
+						</div>
+					`}
 					<div class="card">
 						<h3>Quick actions</h3>
 						<div class="actions">

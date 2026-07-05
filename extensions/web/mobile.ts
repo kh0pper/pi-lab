@@ -404,25 +404,28 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 				}
 			}
 
-			// Regular prompt — no matching slash command. Images (pi-lab fork)
-			// ride the message as native ImageContent so vision models see
-			// them directly, exactly like pasting into the terminal.
+			// Regular prompt — no matching slash command. Delivered as a real
+			// USER message via sendUserMessage → prompt(), NOT as a custom
+			// message with triggerTurn: custom-message turns bypass prompt()
+			// and never fire before_agent_start, so extension prompt additions
+			// (tool-hint, session-state-loader, hooks) silently didn't apply to
+			// phone-driven turns. The 📱 prefix keeps provenance visible in the
+			// TUI; history rebuild strips it. deliverAs=steer when the agent is
+			// mid-run — prompt() THROWS without it while streaming and the
+			// ExtensionAPI wrapper would swallow the error (prompt lost).
+			// Images (pi-lab fork) ride the message as native ImageContent so
+			// vision models see them directly, exactly like pasting into the
+			// terminal.
 			const images = Array.isArray(body.images) ? (body.images as Array<{ dataBase64?: string; mimeType?: string }>) : [];
 			const imageBlocks = images
 				.filter((i) => i?.dataBase64 && i?.mimeType?.startsWith("image/"))
 				.slice(0, 8)
 				.map((i) => ({ type: "image" as const, data: i.dataBase64 as string, mimeType: i.mimeType as string }));
+			const deliver = _lastCtx && !_lastCtx.isIdle() ? ({ deliverAs: "steer" as const }) : undefined;
 			if (imageBlocks.length > 0) {
-				_pi.sendUserMessage([{ type: "text", text: prompt }, ...imageBlocks]);
+				_pi.sendUserMessage([{ type: "text", text: `📱 Mobile: ${prompt}` }, ...imageBlocks], deliver);
 			} else {
-				_pi.sendMessage(
-					{
-						customType: "mobile-prompt",
-						content: `📱 **Mobile:** ${prompt}`,
-						display: true,
-					},
-					{ triggerTurn: true },
-				);
+				_pi.sendUserMessage(`📱 Mobile: ${prompt}`, deliver);
 			}
 			json(res, 200, { ok: true, message: "Prompt submitted" });
 		} catch {
@@ -459,9 +462,10 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 			}
 			const out: Array<{ kind: string; text?: string; [k: string]: unknown }> = [];
 			for (const e of entries) {
-				// Phone-submitted prompts are custom_message entries (customType
-				// "mobile-prompt"), NOT role:"user" messages — without this branch
-				// the user's own messages vanish from the chat on every reload.
+				// Phone-submitted prompts in OLD session logs are custom_message
+				// entries (customType "mobile-prompt") — kept for backward compat.
+				// New sessions deliver them as role:"user" messages with a 📱
+				// prefix (stripped in the user branch below).
 				if (e.type === "custom_message" && e.customType === "mobile-prompt" && typeof e.content === "string") {
 					const t = e.content.replace(/^📱 \*\*Mobile:\*\* /, "").trim();
 					if (t) out.push({ kind: "user", text: t });
@@ -509,7 +513,7 @@ async function handleChatApi(req: IncomingMessage, res: ServerResponse, subPath:
 					if (imgs) text = `${text}  📷×${imgs}`.trim();
 				}
 				if (text.trim()) {
-					if (role === "user") out.push({ kind: "user", text: text.trim() });
+					if (role === "user") out.push({ kind: "user", text: text.trim().replace(/^📱 Mobile: /, "") });
 					else if (role === "assistant") out.push({ kind: "agent", text: text.trim() });
 				}
 				// Tool calls re-render as persistent chips INLINE with their args +
@@ -813,6 +817,72 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, subPath: str
 			json(res, 200, { ok: true, model: q.model });
 		} catch (err) {
 			json(res, 400, { error: (err as Error).message });
+		}
+		return;
+	}
+
+	// MCP server toggles (pi-lab fork) — the PWA "MCP servers" card.
+	// GET returns the merged per-server state for the session cwd; POST writes
+	// a flag-only entry ({enabled|disabled|router}) to <cwd>/.mcp.json via the
+	// mcp-client bus. Servers connect at extension load, so edits apply to the
+	// NEXT session started in this cwd (the card says so).
+	if (p === "/mcp" && req.method === "GET") {
+		if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
+		const q: { cwd?: string; servers?: unknown[] } = {};
+		_pi.events.emit("pi-lab:mcp-status", q);
+		if (!q.servers) { json(res, 503, { error: "mcp-client not loaded" }); return; }
+		json(res, 200, { cwd: q.cwd, servers: q.servers });
+		return;
+	}
+
+	if (p === "/mcp" && req.method === "POST") {
+		try {
+			const body = JSON.parse(await readBody(req)) as { server?: string; patch?: Record<string, boolean | null> };
+			if (!body.server || !body.patch || typeof body.patch !== "object") {
+				json(res, 400, { error: "server and patch required" });
+				return;
+			}
+			if (!_pi) { json(res, 503, { error: "Agent not ready" }); return; }
+			const q: { server?: string; patch?: Record<string, boolean | null>; ok?: boolean; error?: string } = {
+				server: body.server,
+				patch: body.patch,
+			};
+			_pi.events.emit("pi-lab:mcp-project-set", q);
+			if (!q.ok) { json(res, q.error?.startsWith("unknown server") ? 404 : 422, { error: q.error ?? "mcp-client not loaded" }); return; }
+
+			// Persisted — now apply live in this session. One patch key per PWA
+			// tap, so the action maps 1:1. Live failure is not a request failure:
+			// the file change stands and loads next session.
+			const patch = body.patch;
+			const action = patch.router === true ? "router-on"
+				: patch.router === false ? "router-off"
+				: patch.enabled === true || patch.disabled === null ? "enable"
+				: patch.enabled === null || patch.disabled === true ? "disable"
+				: null;
+			let live = false;
+			let liveError: string | undefined;
+			if (action) {
+				const ap: { server: string; action: string; promise?: Promise<{ ok: boolean; error?: string }> } = { server: body.server, action };
+				_pi.events.emit("pi-lab:mcp-apply", ap);
+				if (ap.promise) {
+					try {
+						const r = await Promise.race([
+							ap.promise,
+							new Promise<{ ok: boolean; error?: string }>((resolve) =>
+								setTimeout(() => resolve({ ok: false, error: "live apply timed out (saved for next session)" }), 20_000)),
+						]);
+						live = r.ok;
+						liveError = r.error;
+					} catch (err) {
+						liveError = (err as Error).message;
+					}
+				} else {
+					liveError = "mcp-client live apply unavailable";
+				}
+			}
+			json(res, 200, { ok: true, server: body.server, live, ...(liveError ? { liveError } : {}), note: live ? "applied to this session and saved" : "saved — applies to the next session started in this folder" });
+		} catch {
+			json(res, 400, { error: "Invalid JSON body" });
 		}
 		return;
 	}
