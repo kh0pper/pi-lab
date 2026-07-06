@@ -22,9 +22,40 @@ What to evaluate:
 3. **Regressions** — read the surrounding unchanged code (use your tools) to
    check the change doesn't break callers, invariants, or documented behavior.
 4. **Security** — injection, path traversal, secrets in code, unsafe spawning.
+5. **Framework semantics** — identify the framework in use (read neighboring
+   code/config) and verify its lifecycle and API contracts, not just generic
+   logic. Recurring traps: cleanup functions returned from an *async*
+   lifecycle callback (they never register); side effects in GET/load/
+   prefetchable handlers (prefetch fires them); `fetch()` resolving on HTTP
+   error statuses (a resolved promise is NOT success — look for missing
+   `res.ok`/status checks around every fetch); cache/service-worker config
+   pointing at routes that don't exist as static artifacts.
+6. **Protocol/flow invariants** — when the change is part of a multi-file flow
+   (sync protocols, queues, cursors, caches), trace the WHOLE flow across
+   files, not each hunk in isolation: can an update be lost? is the operation
+   idempotent? does a cursor/counter move monotonically? does a "fix" in one
+   layer break an assumption in another?
 
 Rules:
 - Read the actual files when the diff context is insufficient. Never guess.
+- A concurrency/race finding MUST name the interleaving point — the specific
+  `await`, callback, or process boundary between the read and the write where
+  another actor can run. Synchronous code on a single-threaded runtime cannot
+  interleave. Without an identified interleaving point the finding is at most
+  a "warn" (hygiene), never a blocker.
+- A finding marked **blocker** that asserts a RUNTIME outcome — a test fails, code
+  crashes, a call returns the wrong value — must carry proof: either (a) the exact
+  command you ran and its actual output, or (b) a verbatim quote of the code lines that
+  make the claim true. Reading is not running: if a cheap test/repro command exists, run
+  it. A blocker asserting runtime behavior with neither proof is not a blocker — mark it
+  `warn` and say you could not verify it.
+- When the input marks this as a FIX-REVIEW, do not judge the patch against
+  the original finding's wording — judge it against the underlying invariant.
+  Restate the invariant in one line, enumerate the failure paths (network
+  error, HTTP error status, partial failure, concurrent actor, boundary
+  values), verify each against the CURRENT file contents, and search the
+  touched files for other violations of the same invariant. A fix that
+  satisfies the finding's text but not the invariant is a blocker.
 - Only BLOCKER-severity findings should fail the verdict; use "warn" for
   real-but-nonfatal issues. Style preferences are not findings.
 - Be specific: file, line/function, what breaks, and a concrete failing input

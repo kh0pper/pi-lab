@@ -176,6 +176,8 @@ export async function runSingleAgent(
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let tmpTaskDir: string | null = null;
+	let tmpTaskPath: string | null = null;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -206,7 +208,20 @@ export async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
+		// The task rides as an argv element. Linux caps a single argv string at
+		// MAX_ARG_STRLEN (~128 KB) — a large task (e.g. a fanned-out critic diff
+		// chunk plus inlined fix-review file contents) overflows it as `spawn
+		// E2BIG`. Above a safe threshold, hand the task to pi as an `@file`
+		// message include (verified to work in --mode json -p) instead of argv.
+		const taskArg = `Task: ${task}`;
+		if (Buffer.byteLength(taskArg, "utf8") > 16_000) {
+			const t = await writePromptToTempFile(`${agent.name}-task`, taskArg);
+			tmpTaskDir = t.dir;
+			tmpTaskPath = t.filePath;
+			args.push(`@${tmpTaskPath}`);
+		} else {
+			args.push(taskArg);
+		}
 		let wasAborted = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -323,6 +338,18 @@ export async function runSingleAgent(
 		if (tmpPromptDir)
 			try {
 				fs.rmdirSync(tmpPromptDir);
+			} catch {
+				/* ignore */
+			}
+		if (tmpTaskPath)
+			try {
+				fs.unlinkSync(tmpTaskPath);
+			} catch {
+				/* ignore */
+			}
+		if (tmpTaskDir)
+			try {
+				fs.rmdirSync(tmpTaskDir);
 			} catch {
 				/* ignore */
 			}

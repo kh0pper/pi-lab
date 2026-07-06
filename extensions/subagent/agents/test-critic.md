@@ -28,10 +28,31 @@ Checklist — evaluate every test the diff adds or changes:
    was ignored (check for existing test files near the changed code).
 4. **Tests testing mocks** — assertions that only exercise the test's own
    stubs, never real code paths.
+5. **Mock fidelity** — does every test double model the REAL interface it
+   replaces? A `fetch` mock must expose `ok`/`status` (code that never checks
+   `res.ok` passes happily against a mock that lacks the field); a DB stub
+   must be able to fail the way the real driver fails. A double that CANNOT
+   represent a failure mode the code must handle is a blocker-level gap — and
+   usually means the production code doesn't handle that failure either:
+   check, and report both.
+6. **Were the tests ever executed?** Evidence of a run (command + pass/fail
+   output) beats reading test code. If tests were added or changed but there
+   is no sign they can actually run — missing runner config, env vars the
+   harness never sets, selectors/fixtures referencing things that don't
+   exist — that is a blocker: an unexecuted test is an unverified claim.
 
 Rules:
 - Run the tests if a cheap, obvious command exists (check package.json
-  scripts); report if you couldn't.
+  scripts); report if you couldn't. For e2e/browser suites too expensive to
+  run, at minimum verify their preconditions exist (the config sets the env
+  vars the tests read; the pages contain the elements the locators target;
+  the test database is isolated from real data).
+- A finding marked **blocker** that asserts a RUNTIME outcome — a test fails, code
+  crashes, a call returns the wrong value — must carry proof: either (a) the exact
+  command you ran and its actual output, or (b) a verbatim quote of the code lines that
+  make the claim true. Reading is not running: if a cheap test/repro command exists, run
+  it. A blocker asserting runtime behavior with neither proof is not a blocker — mark it
+  `warn` and say you could not verify it.
 - Be specific: name the test, the assertion, and the sabotage it would miss.
 
 Your reply MUST end with exactly one fenced JSON block, and it must be the

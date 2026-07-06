@@ -64,6 +64,8 @@ interface SubagentSettings {
 	maxStepsPerLeg?: number;
 	decomposeOnFailure?: boolean;
 	decomposeMaxExtraLegs?: number;
+	/** Chain legs that edit test files must run them (default true). */
+	testRunGate?: boolean;
 }
 
 function subagentSettings(): SubagentSettings {
@@ -93,6 +95,42 @@ function logDecompose(row: Record<string, unknown>): void {
 	} catch {
 		// telemetry must never break a chain
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Test-run gate (chains): a leg that writes tests but never executes them is
+// an unverified claim — executor-written tests share executor blind spots and
+// 36/36-green means nothing if the suite never ran. Ground truth is the leg's
+// observed tool calls (a verdict's "ran" claim is telemetry, not proof).
+// ---------------------------------------------------------------------------
+
+const TEST_FILE_RE = /(^|\/)(tests?|__tests__|e2e|spec)\/|\.(test|spec)\.[a-z]+$|_test\.[a-z]+$/i;
+const TEST_CMD_RE =
+	/\b(vitest|jest|pytest|playwright|mocha|ava|tape|phpunit|rspec|ctest|tox)\b|npm (run )?test|yarn test|pnpm test|bun test|node --test|go test|cargo test|mvn test|gradle test|make (check|test)/i;
+
+/**
+ * Returns the test files a leg edited without any observed test-command
+ * execution, or null when the gate has nothing to say.
+ */
+function untestedTestEdits(r: SingleResult): string[] | null {
+	const testFiles = new Set<string>();
+	let ranTests = false;
+	for (const msg of r.messages) {
+		const m = msg as { role?: string; content?: Array<{ type?: string; name?: string; arguments?: Record<string, any> }> };
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+		for (const part of m.content) {
+			if (part?.type !== "toolCall") continue;
+			if (part.name === "edit" || part.name === "write") {
+				const p = part.arguments?.path ?? part.arguments?.file_path;
+				if (typeof p === "string" && TEST_FILE_RE.test(p)) testFiles.add(p);
+			} else if (part.name === "bash" || part.name === "bash_background") {
+				const c = part.arguments?.command;
+				if (typeof c === "string" && TEST_CMD_RE.test(c)) ranTests = true;
+			}
+		}
+	}
+	if (testFiles.size === 0 || ranTests) return null;
+	return [...testFiles];
 }
 
 /** Scrub failure evidence to a one-liner (models self-condition on error dumps). */
@@ -136,6 +174,204 @@ async function runLegWithBudget(
 		second.exitCode = second.exitCode || 1;
 	}
 	return second;
+}
+
+export interface RunChainOpts {
+	cwd: string;
+	agents: AgentConfig[];
+	chain: Array<{ agent: string; task: string; cwd?: string }>;
+	toolsOverride?: string[];
+	signal?: AbortSignal;
+	onUpdate?: OnUpdateCallback;
+	makeDetails: (results: SingleResult[]) => SubagentDetails;
+}
+
+export interface RunChainResult {
+	results: SingleResult[];
+	error: { stepNo: number; agentName: string; result: SingleResult } | null;
+}
+
+export async function runChain(opts: RunChainOpts): Promise<RunChainResult> {
+	const results: SingleResult[] = [];
+	let previousOutput = "";
+	const cfg = subagentSettings();
+	const decomposeOn = cfg.decomposeOnFailure !== false;
+	const maxExtraLegs = typeof cfg.decomposeMaxExtraLegs === "number" ? cfg.decomposeMaxExtraLegs : 6;
+	let extraLegsUsed = 0;
+
+	// Concatenate ALL text parts of the final assistant message — a verdict
+	// in a second text part must not vanish into fail-open (review fix).
+	const fullFinalText = (r: SingleResult): string => {
+		for (let m = r.messages.length - 1; m >= 0; m--) {
+			const msg = r.messages[m] as { role?: string; content?: Array<{ type?: string; text?: string }> };
+			if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+			const text = msg.content
+				.filter((p) => p?.type === "text" && typeof p.text === "string")
+				.map((p) => p.text)
+				.join("\n");
+			if (text.trim()) return text;
+		}
+		return "";
+	};
+
+	const legFailed = (r: SingleResult): { failed: boolean; hard: boolean; reason: string } => {
+		const hard = r.exitCode !== 0 || r.stopReason === "error";
+		if (hard) return { failed: true, hard: true, reason: r.errorMessage || r.stderr || "hard error" };
+		if (!decomposeOn) return { failed: false, hard: false, reason: "" };
+		const v = parseLegVerdict(fullFinalText(r));
+		if (v.found && !v.ok) return { failed: true, hard: false, reason: v.reason ?? "verdict: not ok" };
+		return { failed: false, hard: false, reason: "" };
+	};
+
+	for (let i = 0; i < opts.chain.length; i++) {
+		const step = opts.chain[i];
+		let taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+		if (decomposeOn) taskWithContext += VERDICT_INSTRUCTION;
+
+		// Create update callback that includes all previous results
+		const chainUpdate: OnUpdateCallback | undefined = opts.onUpdate
+			? (partial) => {
+					// Combine completed results with current streaming result
+					const currentResult = partial.details?.results[0];
+					if (currentResult) {
+						opts.onUpdate!({ content: partial.content, details: opts.makeDetails([...results, currentResult]) });
+					}
+				}
+			: undefined;
+
+		const result = await runLegWithBudget(
+			opts.cwd,
+			opts.agents,
+			step.agent,
+			taskWithContext,
+			step.cwd,
+			i + 1,
+			opts.signal,
+			chainUpdate,
+			opts.makeDetails,
+			opts.toolsOverride,
+		);
+		results.push(result);
+
+		const aborted = result.stopReason === "aborted";
+		const configError = (result.stderr || "").startsWith("Unknown agent");
+		const fail = legFailed(result);
+
+		if (!fail.failed && !aborted) {
+			previousOutput = stripVerdictBlocks(getFinalOutput(result.messages));
+
+			// ---- test-run gate: tests edited but never executed -------------
+			// Only when the leg could actually run them (bash available).
+			const gateOn =
+				cfg.testRunGate !== false &&
+				(!opts.toolsOverride || opts.toolsOverride.length === 0 || opts.toolsOverride.includes("bash"));
+			const untested = gateOn ? untestedTestEdits(result) : null;
+			if (untested) {
+				let followTask =
+					`Verification follow-up: the previous step modified test files (${untested.join(", ")}) ` +
+					`but never executed any tests. Run the relevant tests now with the project's runner ` +
+					`(check package.json scripts / Makefile), fix any failures that step introduced, and ` +
+					`report pass/fail counts.` +
+					(previousOutput ? `\n\nWhat the previous step did:\n${previousOutput}` : "");
+				if (decomposeOn) followTask += VERDICT_INSTRUCTION;
+				const followUp = await runLegWithBudget(
+					opts.cwd, opts.agents, step.agent, followTask, step.cwd, i + 1, opts.signal,
+					chainUpdate, opts.makeDetails, opts.toolsOverride,
+				);
+				followUp.stepLabel = `${i + 1}.v`;
+				results.push(followUp);
+				const followFail = legFailed(followUp);
+				const followVerdict = parseLegVerdict(fullFinalText(followUp));
+				logDecompose({
+					step: i + 1,
+					agent: step.agent,
+					trigger: "test-gate",
+					reason: `untested test edits: ${untested.join(", ")}`,
+					ran: followVerdict.ran,
+					outcome: followFail.failed ? "followup-failed" : "followup-ok",
+				});
+				if (followFail.failed || followUp.stopReason === "aborted") {
+					return { results, error: { stepNo: i + 1, agentName: step.agent, result: followUp } };
+				}
+				previousOutput = stripVerdictBlocks(getFinalOutput(followUp.messages));
+			}
+			continue;
+		}
+
+		// ---- decompose gate (chains only; one structural recursion level) ----
+		if (aborted || !decomposeOn || configError || extraLegsUsed + 2 > maxExtraLegs) {
+			logDecompose({
+				step: i + 1,
+				agent: step.agent,
+				trigger: fail.hard ? "exit" : "verdict",
+				reason: scrubEvidence(fail.reason),
+				outcome: aborted ? "aborted" : !decomposeOn ? "disabled" : configError ? "config-error" : "cap-reached",
+			});
+			return { results, error: { stepNo: i + 1, agentName: step.agent, result } };
+		}
+
+		const evidence = scrubEvidence(fail.reason || fullFinalText(result));
+		const splitPrompt =
+			`A chain step failed and must be split. Failed step (agent: ${step.agent}):\n` +
+			`${taskWithContext.slice(0, 4000)}\n\nFailure evidence: ${evidence}\n\n` +
+			`Split it into 2-4 smaller sub-steps that together accomplish the original step; ` +
+			`each must be independently executable by the same agent in a few tool calls. ` +
+			`Output ONLY a numbered list (1. ... 4.), one sub-step per line, no preamble.`;
+		// splitter + sub-legs: runSingleAgent with the budget directly, NO retry —
+		// decompose IS the retry. toolsOverride propagates (plan-mode read-only).
+		const split = await runSingleAgent(
+			opts.cwd, opts.agents, "splitter", splitPrompt, step.cwd, i + 1, opts.signal,
+			chainUpdate, opts.makeDetails, opts.toolsOverride, maxStepsPerLeg(),
+		);
+		// fullFinalText, not getFinalOutput: the list may live in a later
+		// text part of the final message (same multi-part trap as verdicts).
+		const subTasks = parseNumberedList(fullFinalText(split)).slice(
+			0,
+			Math.min(4, maxExtraLegs - extraLegsUsed),
+		);
+		if (split.exitCode !== 0 || split.stopReason === "error" || subTasks.length < 2) {
+			logDecompose({
+				step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
+				reason: evidence, outcome: "split-unparseable",
+			});
+			return { results, error: { stepNo: i + 1, agentName: step.agent, result } };
+		}
+
+		result.decomposed = true;
+		let subPrev = previousOutput; // sub-step 1 sees the ORIGINAL {previous}
+		let rescued = true;
+		for (let k = 0; k < subTasks.length; k++) {
+			let subTask =
+				`${subTasks[k]}\n\nOriginal goal (this is one part of it): ${step.task.slice(0, 500)}` +
+				(subPrev ? `\n\nContext from earlier work:\n${subPrev}` : "");
+			if (decomposeOn) subTask += VERDICT_INSTRUCTION;
+			const r = await runSingleAgent(
+				opts.cwd, opts.agents, step.agent, subTask, step.cwd, i + 1, opts.signal,
+				chainUpdate, opts.makeDetails, opts.toolsOverride, maxStepsPerLeg(),
+			);
+			r.stepLabel = `${i + 1}.${k + 1}`;
+			results.push(r);
+			extraLegsUsed++;
+			const subFail = legFailed(r);
+			if (subFail.failed || r.stopReason === "aborted" || r.budgetExceeded) {
+				logDecompose({
+					step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
+					reason: evidence, subStepCount: subTasks.length, outcome: "sub-step-failed",
+				});
+				rescued = false;
+				return { results, error: { stepNo: i + 1, agentName: step.agent, result: r } };
+			}
+			subPrev = stripVerdictBlocks(getFinalOutput(r.messages));
+		}
+		if (rescued) {
+			logDecompose({
+				step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
+				reason: evidence, subStepCount: subTasks.length, outcome: "rescued",
+			});
+			previousOutput = subPrev; // step N+1 sees the LAST sub-step's output
+		}
+	}
+	return { results, error: null };
 }
 
 function formatTokens(count: number): string {
@@ -413,161 +649,24 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-				const cfg = subagentSettings();
-				const decomposeOn = cfg.decomposeOnFailure !== false;
-				const maxExtraLegs = typeof cfg.decomposeMaxExtraLegs === "number" ? cfg.decomposeMaxExtraLegs : 6;
-				let extraLegsUsed = 0;
-
-				// Concatenate ALL text parts of the final assistant message — a verdict
-				// in a second text part must not vanish into fail-open (review fix).
-				const fullFinalText = (r: SingleResult): string => {
-					for (let m = r.messages.length - 1; m >= 0; m--) {
-						const msg = r.messages[m] as { role?: string; content?: Array<{ type?: string; text?: string }> };
-						if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-						const text = msg.content
-							.filter((p) => p?.type === "text" && typeof p.text === "string")
-							.map((p) => p.text)
-							.join("\n");
-						if (text.trim()) return text;
-					}
-					return "";
-				};
-
-				const chainError = (stepNo: number, agentName: string, r: SingleResult) => {
+				const makeChainDetails = makeDetails("chain");
+				const { results, error } = await runChain({
+					cwd: ctx.cwd,
+					agents,
+					chain: params.chain,
+					toolsOverride: params.toolsOverride,
+					signal,
+					onUpdate,
+					makeDetails: makeChainDetails,
+				});
+				if (error) {
+					const r = error.result;
 					const errorMsg = r.errorMessage || r.stderr || getFinalOutput(r.messages) || "(no output)";
 					return {
-						content: [{ type: "text" as const, text: `Chain stopped at step ${stepNo} (${agentName}): ${errorMsg}` }],
-						details: makeDetails("chain")(results),
+						content: [{ type: "text", text: `Chain stopped at step ${error.stepNo} (${error.agentName}): ${errorMsg}` }],
+						details: makeChainDetails(results),
 						isError: true,
 					};
-				};
-
-				const legFailed = (r: SingleResult): { failed: boolean; hard: boolean; reason: string } => {
-					const hard = r.exitCode !== 0 || r.stopReason === "error";
-					if (hard) return { failed: true, hard: true, reason: r.errorMessage || r.stderr || "hard error" };
-					if (!decomposeOn) return { failed: false, hard: false, reason: "" };
-					const v = parseLegVerdict(fullFinalText(r));
-					if (v.found && !v.ok) return { failed: true, hard: false, reason: v.reason ?? "verdict: not ok" };
-					return { failed: false, hard: false, reason: "" };
-				};
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					let taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-					if (decomposeOn) taskWithContext += VERDICT_INSTRUCTION;
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runLegWithBudget(
-						ctx.cwd,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-						params.toolsOverride,
-					);
-					results.push(result);
-
-					const aborted = result.stopReason === "aborted";
-					const configError = (result.stderr || "").startsWith("Unknown agent");
-					const fail = legFailed(result);
-
-					if (!fail.failed && !aborted) {
-						previousOutput = stripVerdictBlocks(getFinalOutput(result.messages));
-						continue;
-					}
-
-					// ---- decompose gate (chains only; one structural recursion level) ----
-					if (aborted || !decomposeOn || configError || extraLegsUsed + 2 > maxExtraLegs) {
-						logDecompose({
-							step: i + 1,
-							agent: step.agent,
-							trigger: fail.hard ? "exit" : "verdict",
-							reason: scrubEvidence(fail.reason),
-							outcome: aborted ? "aborted" : !decomposeOn ? "disabled" : configError ? "config-error" : "cap-reached",
-						});
-						return chainError(i + 1, step.agent, result);
-					}
-
-					const evidence = scrubEvidence(fail.reason || fullFinalText(result));
-					const splitPrompt =
-						`A chain step failed and must be split. Failed step (agent: ${step.agent}):\n` +
-						`${taskWithContext.slice(0, 4000)}\n\nFailure evidence: ${evidence}\n\n` +
-						`Split it into 2-4 smaller sub-steps that together accomplish the original step; ` +
-						`each must be independently executable by the same agent in a few tool calls. ` +
-						`Output ONLY a numbered list (1. ... 4.), one sub-step per line, no preamble.`;
-					// splitter + sub-legs: runSingleAgent with the budget directly, NO retry —
-					// decompose IS the retry. toolsOverride propagates (plan-mode read-only).
-					const split = await runSingleAgent(
-						ctx.cwd, agents, "splitter", splitPrompt, step.cwd, i + 1, signal,
-						chainUpdate, makeDetails("chain"), params.toolsOverride, maxStepsPerLeg(),
-					);
-					// fullFinalText, not getFinalOutput: the list may live in a later
-					// text part of the final message (same multi-part trap as verdicts).
-					const subTasks = parseNumberedList(fullFinalText(split)).slice(
-						0,
-						Math.min(4, maxExtraLegs - extraLegsUsed),
-					);
-					if (split.exitCode !== 0 || split.stopReason === "error" || subTasks.length < 2) {
-						logDecompose({
-							step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
-							reason: evidence, outcome: "split-unparseable",
-						});
-						return chainError(i + 1, step.agent, result);
-					}
-
-					result.decomposed = true;
-					let subPrev = previousOutput; // sub-step 1 sees the ORIGINAL {previous}
-					let rescued = true;
-					for (let k = 0; k < subTasks.length; k++) {
-						let subTask =
-							`${subTasks[k]}\n\nOriginal goal (this is one part of it): ${step.task.slice(0, 500)}` +
-							(subPrev ? `\n\nContext from earlier work:\n${subPrev}` : "");
-						if (decomposeOn) subTask += VERDICT_INSTRUCTION;
-						const r = await runSingleAgent(
-							ctx.cwd, agents, step.agent, subTask, step.cwd, i + 1, signal,
-							chainUpdate, makeDetails("chain"), params.toolsOverride, maxStepsPerLeg(),
-						);
-						r.stepLabel = `${i + 1}.${k + 1}`;
-						results.push(r);
-						extraLegsUsed++;
-						const subFail = legFailed(r);
-						if (subFail.failed || r.stopReason === "aborted" || r.budgetExceeded) {
-							logDecompose({
-								step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
-								reason: evidence, subStepCount: subTasks.length, outcome: "sub-step-failed",
-							});
-							rescued = false;
-							return chainError(i + 1, step.agent, r);
-						}
-						subPrev = stripVerdictBlocks(getFinalOutput(r.messages));
-					}
-					if (rescued) {
-						logDecompose({
-							step: i + 1, agent: step.agent, trigger: fail.hard ? "exit" : "verdict",
-							reason: evidence, subStepCount: subTasks.length, outcome: "rescued",
-						});
-						previousOutput = subPrev; // step N+1 sees the LAST sub-step's output
-					}
 				}
 				return {
 					content: [
@@ -576,7 +675,7 @@ export default function (pi: ExtensionAPI) {
 							text: stripVerdictBlocks(getFinalOutput(results[results.length - 1].messages)) || "(no output)",
 						},
 					],
-					details: makeDetails("chain")(results),
+					details: makeChainDetails(results),
 				};
 			}
 

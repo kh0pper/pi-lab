@@ -19,7 +19,7 @@
  * - Callers must pass the CONCATENATION of all text parts of the final
  *   assistant message (a verdict in a second text part must not vanish).
  * - Accept drifted fences (```json / bare ```), not only ```verdict.
- * - Key-strictness (≤2 keys: ok + optional reason) applies ONLY to ok:true
+ * - Key-strictness (ok + optional reason/ran) applies ONLY to ok:true
  *   candidates — an explicit ok:false in any shape counts (padded honest
  *   failures must not become successes). Strictness exists to reject unrelated
  *   quoted JSON that happens to contain an "ok" field.
@@ -33,6 +33,8 @@
 export interface LegVerdict {
 	ok: boolean;
 	reason?: string;
+	/** Commands the leg claims to have executed to verify its work (optional). */
+	ran?: string[];
 	/** false when no verdict block was found (fail-open success). */
 	found: boolean;
 }
@@ -40,10 +42,11 @@ export interface LegVerdict {
 export const VERDICT_INSTRUCTION =
 	`\n\nFINAL OUTPUT REQUIREMENT: end your reply with a fenced verdict block exactly like:\n` +
 	"```verdict\n" +
-	`{"ok": true|false, "reason": "one line, required when ok is false"}\n` +
+	`{"ok": true|false, "reason": "one line, required when ok is false", "ran": ["test/build commands you executed"]}\n` +
 	"```\n" +
 	`Set "ok": false with a one-line reason if you could NOT fully complete the task ` +
-	`(file missing, anchor not found, tests failing, ...). Write nothing after the block.`;
+	`(file missing, anchor not found, tests failing, ...). "ran" is optional — list the ` +
+	`verification commands you actually executed, if any. Write nothing after the block.`;
 
 interface Candidate {
 	obj: Record<string, unknown>;
@@ -98,16 +101,18 @@ export function parseLegVerdict(output: string): LegVerdict {
 	const pick = [...candidates].reverse().find((c) => c.tagged) ?? candidates[candidates.length - 1];
 	if (!pick) return { ok: true, found: false };
 	const obj = pick.obj;
+	const ranOf = (o: Record<string, unknown>): string[] | undefined =>
+		Array.isArray(o.ran) && o.ran.every((x) => typeof x === "string") ? (o.ran as string[]) : undefined;
 	if (obj.ok === false) {
 		// explicit failure counts in any shape
-		return { ok: false, reason: typeof obj.reason === "string" ? obj.reason : undefined, found: true };
+		return { ok: false, reason: typeof obj.reason === "string" ? obj.reason : undefined, ran: ranOf(obj), found: true };
 	}
-	// ok:true candidates must be strict (≤2 keys, reason string) — rejects
+	// ok:true candidates must be strict (only ok/reason/ran keys) — rejects
 	// unrelated quoted JSON like {"ok": true, "data": {...}}
 	const keys = Object.keys(obj);
-	const strict = keys.length <= 2 && keys.every((k) => k === "ok" || k === "reason");
+	const strict = keys.length <= 3 && keys.every((k) => k === "ok" || k === "reason" || k === "ran");
 	if (!strict) return { ok: true, found: false };
-	return { ok: true, reason: typeof obj.reason === "string" ? obj.reason : undefined, found: true };
+	return { ok: true, reason: typeof obj.reason === "string" ? obj.reason : undefined, ran: ranOf(obj), found: true };
 }
 
 /** Remove verdict-shaped fenced blocks so they never leak into {previous} or final content. */
@@ -115,7 +120,12 @@ export function stripVerdictBlocks(output: string): string {
 	return output
 		.replace(/```([a-zA-Z]*)\n([\s\S]*?)```/g, (whole, _tag, body) => {
 			const obj = tryParse(String(body).trim());
-			return obj && typeof obj.ok === "boolean" && Object.keys(obj).length <= 2 ? "" : whole;
+			const verdictShaped =
+				obj &&
+				typeof obj.ok === "boolean" &&
+				Object.keys(obj).length <= 3 &&
+				Object.keys(obj).every((k) => k === "ok" || k === "reason" || k === "ran");
+			return verdictShaped ? "" : whole;
 		})
 		.trim();
 }
