@@ -65,7 +65,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-cod
 import { isRunning, readLocalModels, startModel } from "../../lib/local-models.mjs";
 import { raceWithPhone } from "../shared/remote-ask.js";
 import { discoverAgents } from "../subagent/agents.js";
-import { selectSiblings } from "./context.js";
+import { mergeCarriedFindings, selectSiblings } from "./context.js";
 import { buildVerdictRecoveryTask, writeCriticDebug } from "./debug.js";
 import { dispatchFixChain } from "./fix-dispatch.js";
 import type { FindingRef } from "./cluster.js";
@@ -1124,16 +1124,31 @@ export default function (pi: ExtensionAPI) {
 			// drain-race finding the next round needed). Keep the prior state.
 			const allParseErrors = verdicts.length > 0 && verdicts.every((v) => v.verdict.parseError);
 			if (!allParseErrors) {
+				// Carried findings: a recent failed run's unresolved findings ride
+				// along until a passed run clears the sidecar — recall is stochastic
+				// run-to-run (the drain-race P0 vanished between rounds), so the
+				// sidecar accumulates instead of replacing. Match set is the
+				// UNFILTERED current findings: re-raised or refuted-this-run
+				// findings are not carried back in.
+				const currentAll = verdicts.flatMap((v) => v.verdict.findings.map((f) => ({ agent: v.agent, ...f })));
+				const currentSaved = verdicts.flatMap((v) =>
+					v.verdict.findings
+						.filter((f) => !(f as RefutableFinding).refuted)
+						.map((f) => ({ agent: v.agent, ...f })),
+				);
+				const prior = loadLastFindings(ctx.cwd);
+				const findings = allPassedFinal
+					? currentSaved
+					: mergeCarriedFindings(prior, currentAll, currentSaved, Date.now());
+				const carriedAny = findings.some((f) => f.detail?.startsWith("[carried]"));
 				saveLastFindings(ctx.cwd, {
 					ts: row.ts,
 					ref,
-					changedFiles: changedList,
+					// Carried findings may cite files outside this run's diff — union
+					// the lists so fix-review overlap/inline still covers them.
+					changedFiles: carriedAny && prior ? [...new Set([...changedList, ...prior.changedFiles])] : changedList,
 					passed: allPassedFinal,
-					findings: verdicts.flatMap((v) =>
-						v.verdict.findings
-							.filter((f) => !(f as RefutableFinding).refuted)
-							.map((f) => ({ agent: v.agent, ...f })),
-					),
+					findings,
 				});
 			}
 			const lines: string[] = [`**Critique ${allPassedFinal ? "PASSED ✓" : "FAILED ✗"}** (${refNote})`, ""];

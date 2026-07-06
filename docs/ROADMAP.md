@@ -75,6 +75,55 @@ retest and consider restoring true new-session semantics for /handoff.
   coordination for cheap revert.
 - TypeScript checker when node ≥ 22.6 (`--experimental-strip-types`) or a fast TS parser.
 
+### Context-loading latency — IMPLEMENTED 2026-07-06 (co-resident copilot + prefix cache)
+Plan: `docs/plans/2026-07-06-context-loading-speedups.md` (adversarially reviewed: REVISE →
+fixed → APPROVE). What shipped:
+- **Copilot 27B** (`crow-local-27b-copilot/qwen3.6-27b`, port 8010, 65536 ctx, TEXT-ONLY,
+  `--cache-reuse 256`, `~30GB`) co-resides with the 35b. `critic.refuteModel` +
+  `critic.diverseModel` point at it → refute-pass/probe/diverse critiques no longer evict
+  the session model at all. Solo full-262k 27b (port 8006) unchanged.
+- **Eviction matrix** now has a `"solo"` group: 35b + copilot evict `["heavy","solo"]`,
+  solo evicts `["heavy","standard"]` (one-tap 35b restore preserved), heavies evict all
+  three groups. Only the 35b+copilot pair ever co-resides.
+- **Measured**: copilot start = 20s warm, ZERO 35b interruption (was: full 35b eviction +
+  ~2-3 min reload per refute/probe); prefix cache on the copilot = 8,453-token prefill
+  30.2s on call 1 → 515-token tail 2.1s on call 2 (**~14x**); steady state both-up =
+  22GB available, swap stable; bot service on :8003 uninterrupted throughout.
+- **Deliberately NOT done**: `--cache-reuse` on the 35b/solo (llama-server hard-disables it
+  under `--mmproj` — verified in the image binary; a restart would have bought nothing),
+  critic task-ordering for shared prefixes (per-slot cache + concurrency — measure first),
+  KV slot save/restore (mostly obsoleted by co-residency; revisit for heavies).
+- Follow-ups: the recall probe's idle-only gating is now conservative (a probe no longer
+  evicts the session model) — could relax after observing the pair under load; consider a
+  pair-restore helper after heavy runs (copilot self-heal measured at 20s, acceptable).
+
+### (superseded pin — original exploration notes, kept for the ranked list)
+The harness swaps the single local slot constantly (critics / refute-pass / probe /
+fix-dispatch restore), and every swap pays weight load PLUS cold-KV re-prefill of large
+contexts. Ranked ideas, cheapest first:
+1. **Co-resident standards (config-only, biggest win).** Both standards currently carry
+   `evicts: ["heavy","standard"]` — the 35b and 27b evict EACH OTHER, yet the box shows
+   ~49GB available WITH the 35b loaded and the 27b needs ~25GB. Change both standards to
+   `evicts: ["heavy"]` and the refute-pass/probe swaps disappear entirely (35b stays
+   serving bots on :8003 while the 27b refutes). Validate RAM headroom under concurrent
+   load before committing; heavies keep evicting everything.
+2. **llama.cpp prefix caching.** Confirm `cache_prompt` is on (default in recent servers)
+   and add `--cache-reuse 256` to the compose commands — repeated prompt prefixes skip
+   prefill. Biggest effect on the interactive session (each turn re-sends the whole
+   conversation; with reuse the server prefills only the delta) and on critic re-runs.
+3. **Shared-prefix task ordering.** Critic units start with the per-agent system prompt
+   (differs per critic) followed by the big shared artifact — inverting the TASK-side
+   content so the shared artifact leads would let unit 2 hit unit 1's prefix cache.
+   Caveat: prefix cache is per-slot; concurrency spreads units across slots, so measure
+   before restructuring prompts.
+4. **KV slot save/restore across swaps.** `--slot-save-path` + `POST /slots/{id}?action=
+   save|restore` can persist the SESSION model's KV to NVMe before an eviction and restore
+   it after, so the session's next turn skips re-prefilling the whole conversation.
+   Same-model only (KV is architecture-specific); files are GB-scale but NVMe-fast.
+5. Cloud legs: use provider-side context caching where offered (GLM planner) — minor here.
+Measurement hooks already exist: telemetry `durationMs`, llama.cpp `prompt eval` log lines.
+Start with (1): flip the config, time a refute-pass before/after.
+
 ### Future tournament hooks (documented, not built)
 - `[HARD]` marker on a plan step routing that step through /tournament from the plan executor.
 - Re-tournamenting a whole plan from its pre-execution checkpoint (needs reliable
@@ -158,6 +207,15 @@ Design: `docs/specs/2026-07-05-critic-precision-and-fix-dispatch-design.md`. Pla
   sidecar (it had erased the prior round's findings and disarmed fix-review). Telemetry
   rows gain `durationMs` and `recovered`; the fix-dispatch completion message now says
   "legs completed", steering to the judging critique instead of implying fixes are proven.
+  Round-3 validation added two more: (6) **carried findings** — a recent failed run's
+  unresolved findings ride into the next failed save (tagged `[carried]`, capped 30, cleared
+  by a pass, never resurrected past a refute) because recall proved stochastic run-to-run:
+  the drain-race P0 was found in round 1 and NOT re-found by round 3 on the same artifact;
+  (7) **no-edit leg warning** — a fixer leg that completes with zero file edits triggers a
+  warning + `noEditClusters` telemetry (fail-open verdicts hid a leg that skipped its top
+  finding). Also: `.ts/.tsx` edits now syntax-gate through esbuild (~6ms, pinned devDep —
+  the D1 v2 checker half), and `scripts/critic-gate-report.py` evaluates the six flip
+  criteria in one command (currently: keep `tournament.auto` OFF, 11/30 rows).
 - **Follow-up round (2026-07-06, review minors M1/M2/M4)** — cited file tokens are
   canonicalized against the changed-file list before subsystem-matching/keying (the same file
   cited two path-forms keys ONE cluster; a bare basename now matches full-path subsystem
