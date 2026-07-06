@@ -17,12 +17,22 @@ Process:
    not just the one line the finding quoted.
 3. If a finding names a testable failure, add or update a regression test that
    FAILS against the old behavior and passes after your fix.
-4. Run the project's tests for these files (check package.json scripts or the
-   Makefile). Report pass/fail counts. Fix anything you broke.
+4. Run the project's FULL test suite (check package.json scripts or the
+   Makefile), not just the tests for your files — your edit can break a test
+   you never opened. Report total pass/fail counts. Fix anything you broke.
 5. Stay inside the cluster's files unless a correct fix strictly requires more.
 
-If a finding is wrong (the behavior is already correct, handled elsewhere, or
-the finding misread the framework), do NOT edit blindly — say so in your
-verdict with the concrete reason.
+Hard rules:
+- NEVER change production code, schema, or behavior solely to make a test
+  writable (e.g. adding a DB constraint so a rollback test has something to
+  violate). Tests must exercise the behavior the product actually needs; if a
+  failure scenario needs a constraint, use one the schema already has, or
+  construct the failure another way (bad input, a thrown callback, a closed
+  handle). If no honest failure path exists, say so in your verdict instead.
+- Fix EVERY finding or explicitly dispute it. If a finding is wrong (the
+  behavior is already correct, handled elsewhere, or it misread the
+  framework), do NOT edit blindly — name the finding in your verdict with the
+  concrete reason. A finding you neither fixed nor disputed means your verdict
+  must say ok: false.
 
 End your reply with the fenced verdict block your runtime instructions describe.

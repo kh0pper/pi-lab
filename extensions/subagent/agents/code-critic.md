@@ -49,6 +49,13 @@ Rules:
   make the claim true. Reading is not running: if a cheap test/repro command exists, run
   it. A blocker asserting runtime behavior with neither proof is not a blocker — mark it
   `warn` and say you could not verify it.
+- **Declared invariants outrank your severity judgment.** When the task lists
+  subsystem invariants and your finding shows one violated (with the evidence
+  the rule above requires), the severity IS "blocker" — the project already
+  made that call by declaring the invariant. Never file a demonstrated
+  violation of a declared invariant as a warn, however plausible the
+  mitigating circumstances seem; name which invariant it violates in the
+  detail.
 - When the input marks this as a FIX-REVIEW, do not judge the patch against
   the original finding's wording — judge it against the underlying invariant.
   Restate the invariant in one line, enumerate the failure paths (network

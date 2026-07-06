@@ -14,8 +14,10 @@
  * Checkers (settings `editGate.checkers` extends/overrides; keyed by extension):
  *   .js/.mjs/.cjs → node --check          .py → python3 ast.parse (no .pyc litter)
  *   .sh/.bash     → bash -n               .json → JSON.parse (in-process)
- *   .ts/.tsx: NONE in v1 — there is no fast TS checker on node 20 (tsc is
- *   seconds-slow) and a slow gate on every edit is worse than none.
+ *   .ts/.tsx      → esbuild transform (SYNTAX only, no type checking — same
+ *   standard as node --check for JS; ~50ms warm). The binary is resolved from
+ *   THIS package's node_modules so the gate works in any edited project;
+ *   missing binary fails open via ENOENT.
  * Every check has a hard ~1.5s kill timeout: emitToolResult awaits handlers
  * serially, so a hung checker would stall the whole agent loop on every edit.
  *
@@ -46,10 +48,21 @@ interface EditGateConfig {
 
 const CHECK_TIMEOUT_MS = 1500;
 
+// esbuild ships in this package's node_modules — absolute path so the gate
+// covers TS edits in ANY project (the edited repo need not depend on esbuild).
+// Loader is inferred from the file extension; --outfile=/dev/null discards
+// output. A missing binary is ENOENT → fail open.
+const ESBUILD_BIN = resolve(new URL(".", import.meta.url).pathname, "..", "node_modules", ".bin", "esbuild");
+const ESBUILD_CHECK = [ESBUILD_BIN, "--outfile=/dev/null", "--log-level=error"];
+
 const DEFAULT_CHECKERS: Record<string, string[]> = {
 	".js": ["node", "--check"],
 	".mjs": ["node", "--check"],
 	".cjs": ["node", "--check"],
+	".ts": ESBUILD_CHECK,
+	".tsx": ESBUILD_CHECK,
+	".mts": ESBUILD_CHECK,
+	".cts": ESBUILD_CHECK,
 	// ast.parse, not py_compile: py_compile's job is WRITING a .pyc (ignores -B),
 	// which would litter __pycache__ into the user's tree on every edit.
 	".py": ["python3", "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])"],

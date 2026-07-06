@@ -18,7 +18,7 @@
 	},
 	"scripts": {
 		"test:extensions": "fail=0; for f in extensions/*.ts extensions/*/index.ts; do case \"$f\" in extensions/todo.ts|extensions/subagent/index.ts) echo \"=== $f === SKIP (imports @mariozechner/pi-ai; works at pi runtime but jiti standalone hits the pi-ai CJS exports gap)\"; continue;; extensions/plan-mode/index.ts|extensions/web/index.ts|extensions/critic/index.ts|extensions/tournament.ts) echo \"=== $f === SKIP (value-imports pi internals/pi-tui; resolvable only through pi's runtime alias map)\"; continue;; esac; echo \"=== $f ===\"; ./bin/pi-extension-check \"$f\" || fail=1; done; [ \"$fail\" -ne 0 ] && exit 1; npm run test:critic && npm run test:lib",
-		"test:critic": "node extensions/critic/context.test.mjs && node extensions/critic/refute.test.mjs && node extensions/critic/cluster.test.mjs",
+		"test:critic": "node extensions/critic/context.test.mjs && node extensions/critic/refute.test.mjs && node extensions/critic/cluster.test.mjs && node extensions/critic/debug.test.mjs",
 		"test:lib": "node lib/local-models.test.mjs"
 	},
 	"dependencies": {
@@ -30,5 +30,8 @@
 	},
 	"engines": {
 		"node": ">=18.0.0"
+	},
+	"devDependencies": {
+		"esbuild": "^0.28.1"
 	}
 }

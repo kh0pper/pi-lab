@@ -18,7 +18,15 @@ set -e
 EXT="${1:?usage: pi-extension-check <path-to-extension.ts>}"
 [ -f "$EXT" ] || { echo "FAIL: file not found: $EXT" >&2; exit 2; }
 
-PI_BIN="$(command -v pi || true)"
+# Resolve the GLOBAL pi (the one sessions run) — never a repo-local
+# node_modules/.bin shim: npm prepends that dir to PATH inside `npm run`,
+# and the local pi-coding-agent dependency's deps hoist (no bundled jiti),
+# so the shim both breaks jiti resolution and checks the wrong pi version.
+PI_BIN=""
+for cand in $(command -v -a pi 2>/dev/null || true); do
+    case "$cand" in */node_modules/.bin/*) continue ;; esac
+    PI_BIN="$cand"; break
+done
 if [ -z "$PI_BIN" ]; then
     # Fallback: try common nvm install dirs (newest version wins).
     for cand in ~/.nvm/versions/node/v*/bin/pi; do

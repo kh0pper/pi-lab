@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 const out = join(mkdtempSync(join(tmpdir(), "clu-")), "cluster.mjs");
 execFileSync("npx", ["esbuild", "extensions/critic/cluster.ts", `--outfile=${out}`, "--format=esm", "--log-level=warning"]);
-const { extractPrimaryFile, canonicalizeFile, clusterFindings, buildFixChain } = await import(out);
+const { extractPrimaryFile, canonicalizeFile, clusterFindings, buildFixChain, countFileEdits } = await import(out);
 
 const a = (n, c) => { if (!c) { console.error("FAIL", n); process.exit(1); } console.log("ok", n); };
 
@@ -95,5 +95,20 @@ a("step asks to run tests", /run the (project's )?tests/i.test(syncStep.task));
 a("step threads previous via placeholder", syncStep.task.includes("{previous}"));
 a("no verdict block baked in", !syncStep.task.includes("```verdict"));
 a("custom agent name honored", buildFixChain(clusters, "editor")[0].agent === "editor");
+
+// --- countFileEdits (no-edit fixer-leg detection) ---
+const msgs = [
+  { role: "user", content: [{ type: "text", text: "task" }] },
+  { role: "assistant", content: [
+    { type: "toolCall", name: "read", arguments: { path: "a.ts" } },
+    { type: "toolCall", name: "edit", arguments: { path: "a.ts" } },
+    { type: "toolCall", name: "bash", arguments: { command: "npx vitest run" } },
+  ]},
+  { role: "assistant", content: [{ type: "toolCall", name: "write", arguments: { path: "b.ts" } }] },
+];
+a("counts edit and write tool calls", countFileEdits(msgs) === 2);
+a("read/bash are not edits", countFileEdits([msgs[1]].map(m => ({ ...m, content: m.content.filter(c => c.name !== "edit") }))) === 0);
+a("empty transcript = zero", countFileEdits([]) === 0);
+a("malformed entries are ignored", countFileEdits([null, {}, { role: "assistant", content: "not-an-array" }]) === 0);
 
 console.log("ALL CLUSTER TESTS PASS");

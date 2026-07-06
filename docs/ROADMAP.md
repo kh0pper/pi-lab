@@ -141,6 +141,23 @@ Design: `docs/specs/2026-07-05-critic-precision-and-fix-dispatch-design.md`. Pla
 - Telemetry: `~/.pi/agent/fix-dispatch-log.jsonl` (per-cluster names/counts) plus per-leg rows
   in `decompose-log.jsonl`. Cluster labels feed the same flip-gate telemetry the recall probe
   and refute-pass write to — more signal toward the `tournament.auto` flip criteria above.
+- **Live-run hardening round (2026-07-06, from the first end-to-end loop on the life
+  testbed)** — the full critique→fix-dispatch→fix-review loop ran live and exposed five
+  failure modes, each now closed: (1) **raw-output dump** — a review unit that yields no
+  parseable verdict persists its final output + message tail to `~/.pi/agent/critic-debug/`
+  (pruned to 30) and the dump path rides the parseError string; (2) **one-turn verdict
+  recovery** — a completed-but-driftful critic run gets one budgeted retry ("emit only the
+  fenced verdict for your own analysis"), success marked `recovered` in TUI + telemetry
+  (a 2.5h double-parse-error run motivated both); (3) **fixer hard rules** — run the FULL
+  suite, never change production code/schema solely to make a test writable (a leg added
+  `.unique()` to a prod column for a rollback test), every finding fixed or explicitly
+  disputed else `ok:false` (a leg silently skipped its cluster's top finding);
+  (4) **invariant severity** — a demonstrated violation of a declared `.pi/critique.json`
+  invariant is always a blocker (the drain-race invariant violation was filed as a warn);
+  (5) **sidecar protection** — an all-parse-error run no longer overwrites the findings
+  sidecar (it had erased the prior round's findings and disarmed fix-review). Telemetry
+  rows gain `durationMs` and `recovered`; the fix-dispatch completion message now says
+  "legs completed", steering to the judging critique instead of implying fixes are proven.
 - **Follow-up round (2026-07-06, review minors M1/M2/M4)** — cited file tokens are
   canonicalized against the changed-file list before subsystem-matching/keying (the same file
   cited two path-forms keys ONE cluster; a bare basename now matches full-path subsystem

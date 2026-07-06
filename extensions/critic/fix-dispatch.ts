@@ -15,7 +15,7 @@ import { isRunning, readLocalModels, startModel } from "../../lib/local-models.m
 import { discoverAgents } from "../subagent/agents.js";
 import type { SingleResult, SubagentDetails } from "../subagent/run.js";
 import { type RunChainResult, runChain } from "../subagent/index.js";
-import { buildFixChain, clusterFindings, type FindingRef, type SubsystemDef } from "./cluster.js";
+import { buildFixChain, clusterFindings, countFileEdits, type FindingRef, type SubsystemDef } from "./cluster.js";
 
 const LOG_PATH = join(homedir(), ".pi", "agent", "fix-dispatch-log.jsonl");
 
@@ -146,6 +146,27 @@ export async function dispatchFixChain(d: FixDispatchDeps): Promise<FixDispatchO
 		}
 	}
 
+	// No-edit legs: chain verdicts are fail-open, so a leg can "complete"
+	// without touching a file while its findings stand (live run: the sync
+	// leg silently skipped its cluster's top finding). Detection only — the
+	// judging critique stays the arbiter. Skipped when the chain errored
+	// (later clusters legitimately never ran).
+	let noEditClusters: string[] = [];
+	if (!out.error) {
+		const editsByStep = new Map<number, number>();
+		for (const r of out.results) {
+			const s = r.step ?? 0;
+			editsByStep.set(s, (editsByStep.get(s) ?? 0) + countFileEdits(r.messages as unknown[]));
+		}
+		noEditClusters = clusters.filter((_, i) => (editsByStep.get(i + 1) ?? 0) === 0).map((c) => c.name);
+		if (noEditClusters.length) {
+			d.notify(
+				`Fix-dispatch: leg(s) ${noEditClusters.join(", ")} made NO file edits — their findings are likely unaddressed (check the verdicts; the judging critique will re-raise them).`,
+				"warning",
+			);
+		}
+	}
+
 	logDispatch({
 		v: 1,
 		ts: Date.now(),
@@ -155,6 +176,7 @@ export async function dispatchFixChain(d: FixDispatchDeps): Promise<FixDispatchO
 		sessionModel: d.sessionModel,
 		error: out.error ? { stepNo: out.error.stepNo, agent: out.error.agentName } : null,
 		legs: out.results.length,
+		noEditClusters: noEditClusters.length ? noEditClusters : undefined,
 	});
 
 	return { dispatched: true, clusters: clusters.length, results: out.results, error: out.error };

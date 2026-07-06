@@ -158,6 +158,25 @@ export function clusterFindings(
 	return clusters;
 }
 
+/**
+ * Count file-edit tool calls (edit/write) in a leg's message transcript.
+ * Ground truth for the no-edit fixer-leg warning: chain verdicts are
+ * fail-open, so a leg can "complete" without touching a file (live run
+ * 2026-07-06: the sync leg skipped its cluster's top finding silently).
+ * Messages are treated as untyped JSON so this module stays pi-import-free.
+ */
+export function countFileEdits(messages: unknown[]): number {
+	let n = 0;
+	for (const msg of messages ?? []) {
+		const m = msg as { role?: string; content?: Array<{ type?: string; name?: string }> };
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+		for (const part of m.content) {
+			if (part?.type === "toolCall" && (part.name === "edit" || part.name === "write")) n++;
+		}
+	}
+	return n;
+}
+
 /** One fixer chain step per cluster. `{previous}` is left literal so runChain
  *  threads the earlier clusters' summaries; runChain appends the verdict block. */
 export function buildFixChain(clusters: Cluster[], agent = "fixer"): Array<{ agent: string; task: string }> {

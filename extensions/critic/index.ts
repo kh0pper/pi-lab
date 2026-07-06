@@ -66,6 +66,7 @@ import { isRunning, readLocalModels, startModel } from "../../lib/local-models.m
 import { raceWithPhone } from "../shared/remote-ask.js";
 import { discoverAgents } from "../subagent/agents.js";
 import { selectSiblings } from "./context.js";
+import { buildVerdictRecoveryTask, writeCriticDebug } from "./debug.js";
 import { dispatchFixChain } from "./fix-dispatch.js";
 import type { FindingRef } from "./cluster.js";
 import { applyRefutations, parseRefuterVerdict, REFUTER_INSTRUCTION, resolveRefuteModel, type RefutableFinding } from "./refute.js";
@@ -162,6 +163,8 @@ interface Verdict {
 	passed: boolean;
 	findings: Array<{ category?: string; severity?: string; detail?: string }>;
 	parseError?: string;
+	/** Verdict came from the one-turn recovery retry, not the original run. */
+	recovered?: boolean;
 }
 
 function loadConfig(): CriticConfig {
@@ -246,7 +249,11 @@ export interface CritiqueTelemetryRow {
 		model?: string;
 		/** Blockers of THIS agent's verdict knocked down by the refute-pass. */
 		blockersRefuted?: number;
+		/** Verdict came from the one-turn recovery retry (watch this rate). */
+		recovered?: boolean;
 	}>;
+	/** Wall-clock of the whole critiqueArtifact call (all units + recoveries). */
+	durationMs?: number;
 	agree: boolean;
 	userSentFindings: boolean | null;
 	prior: { ts: number; passed: boolean; filesOverlap: number } | null;
@@ -576,6 +583,7 @@ export interface CritiqueOutcome {
 }
 
 export async function critiqueArtifact(p: CritiqueArtifactParams): Promise<CritiqueOutcome | { missing: string[] }> {
+	const startedAt = Date.now();
 	const cfg = loadConfig();
 	const criticNames = p.criticNames ?? cfg.agents ?? ["code-critic", "test-critic"];
 	const discovered = discoverAgents(p.cwd, "user").agents;
@@ -606,10 +614,49 @@ export async function critiqueArtifact(p: CritiqueArtifactParams): Promise<Criti
 			undefined, undefined, undefined, undefined, makeDetails,
 		);
 		const failed = r.exitCode !== 0 || r.stopReason === "error";
-		const verdict: Verdict = failed
+		const finalOutput = getFinalOutput(r.messages);
+		let verdict: Verdict = failed
 			? { passed: false, findings: [], parseError: r.errorMessage || r.stderr.slice(0, 200) || "critic process failed" }
-			: parseVerdict(getFinalOutput(r.messages));
-		return { agent: name, label, verdict, raw: getFinalOutput(r.messages), model: r.model };
+			: parseVerdict(finalOutput);
+		let raw = finalOutput;
+		if (verdict.parseError && !failed && finalOutput.trim()) {
+			// One-turn verdict recovery: the run completed but drifted past the
+			// verdict contract (seen after multi-hour fix-review runs). Hand the
+			// SAME agent its own analysis and ask for just the fenced block —
+			// tightly budgeted; a failed recovery leaves the fail-closed error.
+			try {
+				const r2 = await runSingleAgent(
+					p.cwd, agents, name, buildVerdictRecoveryTask(finalOutput),
+					undefined, undefined, undefined, undefined, makeDetails, undefined, 4,
+				);
+				if (r2.exitCode === 0 && r2.stopReason !== "error") {
+					const v2 = parseVerdict(getFinalOutput(r2.messages));
+					if (!v2.parseError) {
+						verdict = { ...v2, recovered: true };
+						raw = `${finalOutput}\n\n[verdict recovered by one-turn retry]\n${getFinalOutput(r2.messages)}`;
+					}
+				}
+			} catch {
+				// recovery is best-effort; the original parse error stands
+			}
+		}
+		if (verdict.parseError) {
+			// Fail-closed is correct but was undiagnosable: persist the raw output
+			// so a critic that worked for hours and emitted no verdict can be
+			// inspected (2026-07-06 fix-review run: both critics, nothing to read).
+			const dump = writeCriticDebug(
+				resolve(homedir(), ".pi", "agent", "critic-debug"),
+				{
+					agent: name, label, model: r.model, cwd: p.cwd,
+					parseError: verdict.parseError, exitCode: r.exitCode,
+					stopReason: r.stopReason, stderr: failed ? r.stderr : undefined,
+				},
+				finalOutput,
+				(r.messages as unknown[]).slice(-6),
+			);
+			if (dump) verdict.parseError += ` [raw: ${dump}]`;
+		}
+		return { agent: name, label, verdict, raw, model: r.model };
 	};
 
 	// Fan-out unit list: one per (critic × chunk), or one per critic on the
@@ -636,6 +683,7 @@ export async function critiqueArtifact(p: CritiqueArtifactParams): Promise<Criti
 			parseError: parseErrs.length
 				? `${parseErrs.length}/${mine.length} review unit(s) produced no verdict: ${parseErrs[0].verdict.parseError}`
 				: undefined,
+			recovered: mine.some((x) => x.verdict.recovered) || undefined,
 		};
 		return { agent: name, verdict, raw: mine.map((x) => x.raw).join("\n\n"), model: mine[0]?.model };
 	});
@@ -659,12 +707,14 @@ export async function critiqueArtifact(p: CritiqueArtifactParams): Promise<Criti
 				parseError: v.verdict.parseError ?? null,
 				firstBlocker: blockers[0]?.detail?.slice(0, 200),
 				model: v.model,
+				recovered: v.verdict.recovered,
 			};
 		}),
 		agree: parsed.length < 2 || parsed.every((v) => v.verdict.passed === parsed[0].verdict.passed),
 		userSentFindings: null,
 		prior: findPrior(p.cwd, p.changedFiles ?? []),
 		changedFiles: p.changedFiles,
+		durationMs: Date.now() - startedAt,
 	};
 	return { verdicts, row };
 }
@@ -1067,22 +1117,31 @@ export default function (pi: ExtensionAPI) {
 			if (subsystemNames.length > 0) row.subsystems = subsystemNames;
 
 			// Persist findings for the NEXT run's fix-review detection (a passed
-			// run clears the failed state).
-			saveLastFindings(ctx.cwd, {
-				ts: row.ts,
-				ref,
-				changedFiles: changedList,
-				passed: allPassedFinal,
-				findings: verdicts.flatMap((v) =>
-					v.verdict.findings
-						.filter((f) => !(f as RefutableFinding).refuted)
-						.map((f) => ({ agent: v.agent, ...f })),
-				),
-			});
+			// run clears the failed state). EXCEPTION: a run in which EVERY
+			// verdict parse-errored carries no review information — saving its
+			// empty findings would wipe a prior failed run's sidecar and disarm
+			// fix-review (2026-07-06: a double-parse-error round erased the
+			// drain-race finding the next round needed). Keep the prior state.
+			const allParseErrors = verdicts.length > 0 && verdicts.every((v) => v.verdict.parseError);
+			if (!allParseErrors) {
+				saveLastFindings(ctx.cwd, {
+					ts: row.ts,
+					ref,
+					changedFiles: changedList,
+					passed: allPassedFinal,
+					findings: verdicts.flatMap((v) =>
+						v.verdict.findings
+							.filter((f) => !(f as RefutableFinding).refuted)
+							.map((f) => ({ agent: v.agent, ...f })),
+					),
+				});
+			}
 			const lines: string[] = [`**Critique ${allPassedFinal ? "PASSED ✓" : "FAILED ✗"}** (${refNote})`, ""];
 			for (const v of verdicts) {
 				const icon = v.verdict.passed ? "✓" : "✗";
-				lines.push(`${icon} **${v.agent}**${v.verdict.parseError ? ` — ${v.verdict.parseError} (fail-closed)` : ""}`);
+				lines.push(
+					`${icon} **${v.agent}**${v.verdict.recovered ? " (verdict recovered by one-turn retry)" : ""}${v.verdict.parseError ? ` — ${v.verdict.parseError} (fail-closed)` : ""}`,
+				);
 				for (const f of v.verdict.findings) {
 					lines.push(`  - [${f.severity ?? "?"}/${f.category ?? "?"}] ${f.detail ?? ""}`);
 				}
@@ -1188,7 +1247,7 @@ export default function (pi: ExtensionAPI) {
 								);
 							} else {
 								ctx.ui.notify(
-									`Fix-dispatch: ${outcome.clusters} cluster(s) fixed across ${outcome.results.length} leg(s). Run /critique to judge the fixes.`,
+									`Fix-dispatch: ${outcome.results.length} fixer leg(s) completed over ${outcome.clusters} cluster(s). Legs are fail-open — run /critique to judge whether the findings are actually fixed.`,
 									"info",
 								);
 							}
