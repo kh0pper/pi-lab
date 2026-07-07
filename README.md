@@ -106,6 +106,21 @@ Same models that had missed everything before; the recall gain came from the har
 
 A closing observation from running the full loop end-to-end: **recall is stochastic run-to-run.** The same critic that found a P0 data-loss bug in one round failed to re-find it two rounds later on the same artifact. You cannot prompt that away — you engineer around it: findings persist and carry forward across failed runs until a passing review clears them, verdict parse failures get a recovery retry instead of discarding hours of analysis, and every "it worked" claim is checked against observed tool calls rather than the model's say-so. Treat any single local-model review as a sample, never a proof, and make the harness accumulate what the samples find.
 
+### Research grounding
+
+The mechanisms above weren't invented here — most adapt published results, deliberately, with the differences noted. The defaults were set by a deep-research pass (22 sources, each extracted claim put through 3-vote adversarial verification: 20 confirmed, 5 refuted — the refuted ones are listed so nobody builds on them) in [docs/research/task-decomposition-2026-07.md](docs/research/task-decomposition-2026-07.md). The short map:
+
+| Mechanism (section above) | External evidence | Honest deltas |
+|---|---|---|
+| edit-gate (§1) | SWE-agent ablation ([arXiv:2405.15793](https://arxiv.org/abs/2405.15793)): removing the lint gate on edits drops SWE-bench Lite resolution 18.0%→15.0%; cascading failed edits cause 23.4% of task failures. Task horizon scales super-linearly in per-step reliability past ~80% ([arXiv:2509.09677](https://arxiv.org/html/2509.09677v3)). | The cited ablation is the *blocking* gate; ours is feedback-after-apply. |
+| decompose-on-failure (§1) | ADaPT ([arXiv:2311.05772](https://arxiv.org/abs/2311.05772), NAACL 2024): decomposing *only on executor failure* gains up to +28.3pts; fixed upfront fine-grained planning was the weakest strategy tested. | ADaPT's benchmarks are embodied/web, not coding — transfer is an assumption under live validation (every decompose event is logged). |
+| tournament / best-of-N (§6) | SWE-Search ([arXiv:2410.20285](https://arxiv.org/abs/2410.20285), ICLR 2025): trajectory search = +23% mean relative resolve rate; open ~70B models gained the most. MCTS was the largest single-removal contributor in a separate ablation ([arXiv:2602.00129](https://arxiv.org/pdf/2602.00129)). | Verifier quality is the binding constraint (the Best@K vs Pass@K gap) — which is *why* auto-trigger ships off behind the telemetry gate in §6. |
+| architect/editor split (§1) | Aider's architect mode ([writeup](https://aider.chat/2024/09/26/architect.html)): separating the reasoning pass from the edit-formatting pass, with the biggest gains in the weak/local-model regime. | Medium confidence — vendor self-benchmark, short-horizon tasks. The old single-worker path is retained for comparison. |
+| fresh-context legs + error scrubbing (§1, §2) | Self-conditioning: models degrade when their own past errors appear in context, and model scale does **not** mitigate it ([arXiv:2509.09677](https://arxiv.org/html/2509.09677v3)); successful agent runs are short — abort-and-retry-fresh beats budget extension ([arXiv:2405.15793](https://arxiv.org/abs/2405.15793)). | This is the premise of the whole design ("context discipline is the bottleneck"), arrived at independently and then found corroborated. |
+| layered control loop (everything) | A source-code taxonomy of 13 open coding agents ([arXiv:2604.03515](https://arxiv.org/abs/2604.03515)): the field layers gate/retry/search primitives over a sequential core rather than replacing the loop. | — |
+
+One scale caveat worth repeating from the report: "structure compensates for parameters" is well-evidenced around ~70B and **unproven below ~30B** on repo-level tasks. That's why the 35B is this harness's floor for agentic legs, and why every mechanism logs telemetry instead of assuming it transfers — the validation runs in §"The result" are the local evidence, and they accumulate.
+
 ## Setup with pi-coding-agent
 
 **Prerequisite:** a working [pi](https://github.com/badlogic/pi-mono) install (`npm install -g @mariozechner/pi-coding-agent`, or the scope your distribution uses) with at least one model provider configured.
